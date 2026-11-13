@@ -1,0 +1,29 @@
+{
+  "name": "driving-academy",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev:movil": "vite --config vite.movil.config.mjs",
+    "cert": "mkdir -p .cert && openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 365 -subj /CN=driving-academy -keyout .cert/key.pem -out .cert/cert.pem"
+  },
+  "dependencies": {
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "three": "0.187.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@types/three": "0.187.0",
+    "@vitejs/plugin-react": "6.3.0",
+    "typescript": "~5.9.3",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  }
+}

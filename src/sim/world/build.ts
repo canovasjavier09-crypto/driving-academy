@@ -8,7 +8,12 @@ import {
   heightAt, JUNCTION_R, MANEUVER, MOUNTAIN_X, MANEUVER_SPOTS, maneuverCurbs, obbCorners, PARK, pointInPolygon, RING, RING_EDGE, ROUNDABOUT, SIDEWALK_W, STREET_W, TUNNEL, WORLD_HALF,
   type BuildingStyle, type Junction, type Road, type V2, type WorldMap,
 } from './map';
-import { asphaltTextures, dirtTexture, facadeTexture, grassTexture, macroTexture, paintWearTexture, pavingTexture, shopTexture, blobTexture, type AsphaltSet } from './textures';
+import { facadeTexture, macroTexture, paintWearTexture, shopTexture, blobTexture } from './textures';
+import { polylineLength } from './map';
+import type { PbrLibrary } from './pbr/library';
+import { patchProjected, type PbrGlobals, type ProjectedHandle } from './pbr/shader';
+import { DECALS, DECAL_GRID, type DecalId, type MatId } from './pbr/recipes';
+import { FAR_MATS } from './pbr/jobs';
 import { BAKE_RECT, bakeShadows, bakeSplat, SUN_OFFSET } from './bake';
 import { createWorldUniforms, patchWorldMaterial, type WorldUniforms } from './shading';
 import { LEVEL_SPEC, type QualityLevel } from '../render/quality';
@@ -270,10 +275,15 @@ export interface BuiltWorld {
   uniforms: WorldUniforms;
   /** Aplica un nivel de calidad (tamaño de texturas y distancias de dibujado). */
   setLevel(level: QualityLevel): void;
+  /**
+   * Recorte de texturas si faltan FPS (antes de bajar de nivel):
+   * 1 = las texturas lejanas pasan a 512 px; el resto de pasos los lleva la simulación.
+   */
+  setTexDegrade(step: number): void;
+  /** Mapa de entorno estático: reflejo falso del cielo en el asfalto mojado y los charcos. */
+  setEnvMap(env: THREE.Texture | null): void;
   /** Tiempo: tono del cielo y la sierra, y asfalto mojado (0–1). */
   setWeather(tint: number, wet: number): void;
-  /** Genera de antemano las texturas de un nivel (sin aplicarlas), para que cambiar luego no dé tirones. */
-  prepare(level: QualityLevel): void;
   /** Culling por distancia y LOD simple: muestra u oculta trozos según la cámara. */
   cull(camera: THREE.Vector3): void;
   /** Trozos visibles tras el último `cull` (para depurar). */
@@ -328,11 +338,8 @@ function buildMountains(radius: number, horizon: THREE.Color): THREE.BufferGeome
   return g.build();
 }
 
+/** Texturas dibujadas en canvas (fachadas, locales, desgaste de la pintura): se generan una vez. */
 interface TexSet {
-  asphalt: AsphaltSet;
-  paving: THREE.Texture;
-  grass: THREE.Texture;
-  dirt: THREE.Texture;
   wear: THREE.Texture;
   shop: THREE.Texture;
   facades: Record<BuildingStyle, THREE.Texture>;
@@ -342,10 +349,6 @@ const STYLES: BuildingStyle[] = ['residencial', 'oficinas', 'antiguo', 'moderno'
 
 function makeTexSet(f: number): TexSet {
   return {
-    asphalt: asphaltTextures(f),
-    paving: pavingTexture(f),
-    grass: grassTexture(f),
-    dirt: dirtTexture(f),
     wear: paintWearTexture(f),
     shop: shopTexture(f),
     facades: Object.fromEntries(STYLES.map((st) => [st, facadeTexture(st, f)])) as unknown as Record<BuildingStyle, THREE.Texture>,
@@ -353,7 +356,7 @@ function makeTexSet(f: number): TexSet {
 }
 
 function texList(t: TexSet): THREE.Texture[] {
-  return [t.asphalt.map, t.asphalt.normalMap, t.asphalt.roughnessMap, t.paving, t.grass, t.dirt, t.wear, t.shop, ...Object.values(t.facades)];
+  return [t.wear, t.shop, ...Object.values(t.facades)];
 }
 
 /**
@@ -380,7 +383,51 @@ function hash(str: string) {
   return ((h >>> 0) % 10000) / 10000;
 }
 
-export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld {
+/**
+ * Máscara del muro en las fachadas de viviendas (1 = muro, 0 = ventanas, contraventanas y balcones):
+ * el ladrillo solo se aplica al muro. Sigue el mismo dibujo que `facadeTexture` (512 × 256 unidades).
+ */
+function wallMask(style: BuildingStyle): THREE.DataTexture {
+  const W = 256, H = 128;
+  const px = new Uint8Array(W * H * 4).fill(255);
+  const pad = style === 'antiguo' ? { x: 27, t: 10, b: 8 } : { x: 16, t: 10, b: 12 };
+  for (const fy of [0, 128]) {
+    for (let k = 0; k < 4; k++) {
+      const x0 = 36 + k * 128 - pad.x, x1 = 36 + k * 128 + 56 + pad.x, y0 = fy + 24 - pad.t, y1 = fy + 24 + 78 + pad.b;
+      for (let y = Math.floor(y0 / 2); y < Math.ceil(y1 / 2); y++) {
+        for (let x = Math.floor(x0 / 2); x < Math.ceil(x1 / 2); x++) {
+          // El canvas tiene la y hacia abajo; la textura de datos, hacia arriba.
+          const o = ((H - 1 - y) * W + ((x % W) + W) % W) * 4;
+          px[o] = px[o + 1] = px[o + 2] = 0;
+        }
+      }
+    }
+  }
+  const t = new THREE.DataTexture(px, W, H, THREE.RGBAFormat, THREE.UnsignedByteType);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true;
+  t.needsUpdate = true;
+  return t;
+}
+
+/** Tamaño de textura de cada material según el nivel de calidad y el recorte por FPS. */
+function texSize(id: MatId, level: QualityLevel, degrade: number): number {
+  if (level === 'bajo') return 512;
+  if (degrade >= 1 && FAR_MATS.includes(id)) return 512;
+  return id === 'asphalt' && level === 'alto' ? 2048 : 1024;
+}
+
+/** Tamaño de cada decal en metros (ancho × largo) y cuánto abunda. */
+const DECAL_SPEC: Record<DecalId, { w: number; l: number; weight: number; side?: number }> = {
+  'frenada-doble': { w: 2.0, l: 9, weight: 3 }, 'frenada-curva': { w: 1.6, l: 8, weight: 2 }, parche: { w: 2.6, l: 3.4, weight: 3 }, 'parche-irregular': { w: 2.4, l: 2.4, weight: 2 },
+  aceite: { w: 1.3, l: 1.3, weight: 4 }, goteo: { w: 0.7, l: 6, weight: 3 }, goma: { w: 2.4, l: 10, weight: 2 }, 'marca-borrada': { w: 1.6, l: 5, weight: 2 },
+  'grieta-sellada': { w: 0.9, l: 6, weight: 4 }, 'grieta-ramificada': { w: 1.6, l: 6, weight: 3 }, tapa: { w: 0.8, l: 0.8, weight: 3 }, rejilla: { w: 0.5, l: 0.7, weight: 2, side: 1 },
+  humedad: { w: 2.6, l: 2.6, weight: 2 }, hojas: { w: 1.6, l: 1.6, weight: 2, side: 1 }, 'linea-desgastada': { w: 0.7, l: 5, weight: 2 }, arena: { w: 2.2, l: 2.2, weight: 2, side: 1 },
+};
+
+export function buildWorld(map: WorldMap, startLevel: QualityLevel, lib: PbrLibrary, pg: PbrGlobals, lowTex = false): BuiltWorld {
   const group = new THREE.Group();
   const disposables: { dispose(): void }[] = [];
   const chunks: Chunk[] = [];
@@ -408,15 +455,16 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
     return mesh;
   };
 
-  // --- Texturas: horneadas (fijas) y por nivel de calidad (se generan al pedirlas)
-  const texCache = new Map<number, TexSet>();
-  const getTex = (f: number) => {
-    let t = texCache.get(f);
-    if (!t) {
-      t = makeTexSet(f);
-      texCache.set(f, t);
-    }
-    return t;
+  // --- Texturas: horneadas y de canvas (fijas, una sola vez) y conjuntos PBR de la biblioteca (ya generados y subidos)
+  const tex = makeTexSet(lowTex ? 0.5 : 1);
+  let level = startLevel;
+  let degrade = 0;
+  const pbr = (id: MatId) => lib.get(id, texSize(id, level, degrade));
+  const projected: { h: ProjectedHandle; id: MatId }[] = [];
+  /** Material sin UV (barreras, túnel, farolas…): proyección por el eje dominante en coordenadas del mundo. */
+  const project = <T extends THREE.Material>(m: T, id: MatId, tile: number, o: { albedo?: number; normal?: number; detail?: number; roughMul?: number; roughAdd?: number } = {}) => {
+    projected.push({ h: patchProjected(m, pbr(id), pg, { space: 'world', tile, ...o }), id });
+    return m;
   };
   const macro = macroTexture();
   const bake = bakeShadows(map);
@@ -426,8 +474,7 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
   u.uMacro.value = macro;
   u.uBake.value = bake;
   u.uSplat.value = splat;
-  let tex = getTex(LEVEL_SPEC[startLevel].tex);
-  u.uDirt.value = tex.dirt;
+  disposables.push(...texList(tex));
 
   // --- Terreno ---
   const segs = 170;
@@ -455,8 +502,8 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
   }
   ground.setAttribute('gtint', new THREE.Float32BufferAttribute(tints, 3));
   ground.computeVertexNormals();
-  const groundMat = mat(new THREE.MeshLambertMaterial({ map: tex.grass }));
-  patchWorldMaterial(groundMat, 'ground', u, { macro: 0.35 });
+  const groundMat = mat(new THREE.MeshLambertMaterial({ map: pbr('grassA').albedo }));
+  patchWorldMaterial(groundMat, 'ground', u, pg, { macro: 0.35, detail: 0.4 });
   add(ground, groundMat, { receive: true });
 
   // --- Asfalto, aceras, marcas ---
@@ -597,20 +644,23 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
   stripe(paint, ringPts((R.rIn + R.rOut) / 2), 0, 0.12, [2.5, 2.5]);
 
   // Asfalto con relieve (normal map) y rugosidad; rodadas más lisas, arcén más rugoso.
-  const asphaltMat = mat(new THREE.MeshStandardMaterial({ color: 0x55585e, map: tex.asphalt.map, normalMap: tex.asphalt.normalMap, roughnessMap: tex.asphalt.roughnessMap, roughness: 1, metalness: 0, normalScale: new THREE.Vector2(0.9, 0.9) }));
-  patchWorldMaterial(asphaltMat, 'asphalt', u, { macro: 0.32 });
-  const rampMat = mat(new THREE.MeshStandardMaterial({ color: 0x5b5e63, map: tex.asphalt.map, normalMap: tex.asphalt.normalMap, roughnessMap: tex.asphalt.roughnessMap, roughness: 1, metalness: 0, normalScale: new THREE.Vector2(0.9, 0.9), polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }));
-  patchWorldMaterial(rampMat, 'asphalt', u, { macro: 0.32 });
-  // Pintura vial con desgaste (se descarta donde se ha borrado).
-  const paintMat = mat(new THREE.MeshLambertMaterial({ color: 0xe6e3da, alphaMap: tex.wear, alphaTest: 0.5, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
-  patchWorldMaterial(paintMat, 'baked', u, { macro: 0.25 });
-  const walkMat = mat(new THREE.MeshLambertMaterial({ color: 0xcdc9c0, map: tex.paving }));
-  patchWorldMaterial(walkMat, 'baked', u, { macro: 0.22 });
+  // El albedo ya trae el color; AO + rugosidad van empaquetados en un solo mapa (uPk).
+  const asphaltPk = { uPk: { value: pbr('asphalt').packed as THREE.Texture } };
+  const asphaltMat = mat(new THREE.MeshStandardMaterial({ color: 0xf2f2f2, map: pbr('asphalt').albedo, normalMap: pbr('asphalt').normal, roughness: 1, metalness: 0, normalScale: new THREE.Vector2(1, 1) }));
+  patchWorldMaterial(asphaltMat, 'asphalt', u, pg, { macro: 0.3, detail: 0.45, extra: asphaltPk });
+  const rampMat = mat(new THREE.MeshStandardMaterial({ color: 0xffffff, map: pbr('asphalt').albedo, normalMap: pbr('asphalt').normal, roughness: 1, metalness: 0, normalScale: new THREE.Vector2(1, 1), polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 }));
+  patchWorldMaterial(rampMat, 'asphalt', u, pg, { macro: 0.3, detail: 0.45, extra: asphaltPk });
+  // Pintura vial con desgaste (se descarta donde se ha borrado), grano y relieve propios.
+  const paintMat = mat(new THREE.MeshLambertMaterial({ color: 0xf4f1e8, map: pbr('line').albedo, normalMap: pbr('line').normal, alphaMap: tex.wear, alphaTest: 0.5, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+  patchWorldMaterial(paintMat, 'baked', u, pg, { macro: 0.25, detail: 0.2 });
+  const walkPk = { uPk: { value: pbr('paving').packed as THREE.Texture } };
+  const walkMat = mat(new THREE.MeshLambertMaterial({ color: 0xffffff, map: pbr('paving').albedo, normalMap: pbr('paving').normal }));
+  patchWorldMaterial(walkMat, 'baked', u, pg, { macro: 0.22, detail: 0.35, extra: walkPk });
   add(asphalt.build(), asphaltMat, { receive: true });
   add(ramps.build(), rampMat, { receive: true });
   add(walk.build(), walkMat, { receive: true });
   add(paint.build(), paintMat, { receive: true, order: 1 });
-  add(barrier.build(), mat(new THREE.MeshLambertMaterial({ color: 0xc9c7c0 })), { receive: true });
+  add(barrier.build(), project(mat(new THREE.MeshLambertMaterial({ color: 0xffffff })), 'concrete', 2.4, { albedo: 1.25 }), { receive: true });
 
   // --- Edificios por trozos: una geometría por estilo de fachada y trozo, locales, azoteas y detalles ---
   const facadeGeos = new Map<string, Geo>();
@@ -675,12 +725,19 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
     }
   }
   const facadeMats = new Map<BuildingStyle, THREE.MeshLambertMaterial>(STYLES.map((st) => [st, mat(new THREE.MeshLambertMaterial({ map: tex.facades[st], vertexColors: true }))]));
+  // Ladrillo visto en el muro de las viviendas (más marcado en el casco antiguo). El módulo de fachada mide 12 × 6,4 m.
+  const wallU = { uWallA: { value: pbr('brick').albedo as THREE.Texture }, uWallN: { value: pbr('brick').normal as THREE.Texture } };
+  for (const [st, k] of [['antiguo', 0.85], ['residencial', 0.5]] as [BuildingStyle, number][]) {
+    const mask = wallMask(st);
+    disposables.push(mask);
+    patchWorldMaterial(facadeMats.get(st)!, 'facade', u, pg, { detail: 0.3, extra: { ...wallU, uWallMask: { value: mask }, uWallK: { value: new THREE.Vector3(12 / 1.3, 6.4 / 1.3, k) } } });
+  }
   for (const [key, g] of facadeGeos) add(g.build(), facadeMats.get(key.split('|')[0] as BuildingStyle)!, { chunk: 'far' });
   const shopMat = mat(new THREE.MeshLambertMaterial({ map: tex.shop, vertexColors: true }));
   for (const g of shopGeos.values()) add(g.build(), shopMat, { chunk: 'far' });
-  const roofMat = mat(new THREE.MeshLambertMaterial({ color: 0xb9b6ae, vertexColors: true }));
+  const roofMat = project(mat(new THREE.MeshLambertMaterial({ color: 0xd8d5cc, vertexColors: true })), 'gravel', 3, { albedo: 1.45, normal: 0.8, detail: 0 });
   for (const g of roofGeos.values()) add(g.build(), roofMat, { chunk: 'far' });
-  const detailMat = mat(new THREE.MeshLambertMaterial({ color: 0x9a9890 }));
+  const detailMat = project(mat(new THREE.MeshLambertMaterial({ color: 0xc8c6bd })), 'metal', 1.6, { albedo: 1.1, detail: 0 });
   for (const g of detailGeos.values()) add(g.build(), detailMat, { chunk: 'detail' });
 
   // --- Túnel: monte extruido con hueco, revestimiento y luminarias ---
@@ -705,7 +762,7 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
     const z = T.z + s * (T.halfWidth - inset);
     lining.quad([T.x0, 0, z], [T.x1, 0, z], [T.x1, T.height, z], [T.x0, T.height, z], [0, 0, -s]);
   }
-  add(lining.build(), mat(new THREE.MeshLambertMaterial({ color: 0x8c8a85 })));
+  add(lining.build(), project(mat(new THREE.MeshLambertMaterial({ color: 0xd2d0ca })), 'concrete', 3, { albedo: 1.2 }));
   const lampsT = new Geo();
   for (let x = T.x0 + 6; x < T.x1; x += 12) {
     for (const s of [1, -1]) box(lampsT, x - 1.2, x + 1.2, T.height - 0.35, T.height - inset - 0.01, T.z + s * 5 - 0.15, T.z + s * 5 + 0.15);
@@ -722,7 +779,8 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
   crown2.translate(0.9, 4.6, 0.3);
   const mergedCrown = new THREE.BufferGeometry();
   {
-    const a = crownGeo.toNonIndexed(), b2 = crown2.toNonIndexed();
+    const flat = (g: THREE.BufferGeometry) => (g.index ? g.toNonIndexed() : g);
+    const a = flat(crownGeo), b2 = flat(crown2);
     const pos = new Float32Array([...(a.attributes.position!.array as Float32Array), ...(b2.attributes.position!.array as Float32Array)]);
     mergedCrown.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     mergedCrown.computeVertexNormals();
@@ -807,8 +865,8 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
   const headGeo = new THREE.BoxGeometry(0.35, 0.18, 1.2);
   headGeo.translate(0, 6, 0.5);
   disposables.push(poleGeo, headGeo);
-  const poleMat = mat(new THREE.MeshLambertMaterial({ color: 0x4b5160 }));
-  const headMat = mat(new THREE.MeshLambertMaterial({ color: 0x9aa3b3 }));
+  const poleMat = project(mat(new THREE.MeshStandardMaterial({ color: 0x5c6373, metalness: 0.35, roughness: 1 })), 'metal', 0.9, { albedo: 1.15, detail: 0 });
+  const headMat = project(mat(new THREE.MeshStandardMaterial({ color: 0xaab3c2, metalness: 0.35, roughness: 1 })), 'metal', 0.9, { albedo: 1.15, detail: 0 });
   const lampCells = new Map<string, number[]>();
   map.lamps.forEach((l, i) => {
     const k = cellOf(l.x, l.z);
@@ -841,46 +899,120 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
   disposables.push(dome.geometry, dome.material as THREE.Material, mountains.geometry, mountains.material as THREE.Material);
   group.add(sky);
 
-  // --- Niveles de calidad
+  // --- Decals: marcas de frenada, parches, manchas, grietas selladas, tapas… (planos con un único atlas)
+  {
+    const rand = (() => {
+      let a = 9001;
+      return () => ((a = (a * 16807) % 2147483647) / 2147483647);
+    })();
+    const ids = DECALS as readonly DecalId[];
+    const totalW = ids.reduce((t, id) => t + DECAL_SPEC[id].weight, 0);
+    const pick = (): DecalId => {
+      let x = rand() * totalW;
+      for (const id of ids) if ((x -= DECAL_SPEC[id].weight) <= 0) return id;
+      return ids[0]!;
+    };
+    const geos = new Map<string, Geo>();
+    const put = (id: DecalId, x: number, z: number, heading: number, scale = 1) => {
+      const sp = DECAL_SPEC[id];
+      const hw = (sp.w * scale) / 2, hl = (sp.l * scale) / 2;
+      const fx = Math.sin(heading), fz = Math.cos(heading), rx = fz, rz = -fx;
+      const corner = (a: number, b: number): P3 => {
+        const px = x + rx * hw * a + fx * hl * b, pz = z + rz * hw * a + fz * hl * b;
+        return [px, heightAt(px, pz) + 0.035, pz];
+      };
+      const idx = ids.indexOf(id);
+      const u0 = (idx % DECAL_GRID) / DECAL_GRID, v0 = Math.floor(idx / DECAL_GRID) / DECAL_GRID, d = 1 / DECAL_GRID;
+      getGeo(geos, cellOf(x, z)).quad(corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1), [0, 1, 0], [[u0, v0], [u0 + d, v0], [u0 + d, v0 + d], [u0, v0 + d]]);
+    };
+    for (const road of map.roads) {
+      if (road.closed || road.kind === 'autovia' || road.kind === 'ramal') continue;
+      const L = polylineLength(road.pts);
+      const laneW = road.width / Math.max(1, road.lanes.length);
+      road.lanes.forEach((_lane, li) => {
+        for (let sAt = 14 + rand() * 20; sAt < L - 16; sAt += 16 + rand() * 30) {
+          const id = pick();
+          const pose = map.roadPose(road.id, sAt, li);
+          const sp = DECAL_SPEC[id];
+          // Lo que va junto al bordillo (rejillas, hojas, arena) se desplaza a la derecha del carril exterior.
+          const lat = sp.side ? laneW * 0.38 : (rand() - 0.5) * laneW * 0.35;
+          const x = pose.x + Math.cos(pose.heading) * lat, z = pose.z - Math.sin(pose.heading) * lat;
+          if (map.query(x, z).surface !== 'calzada') continue;
+          put(id, x, z, pose.heading + (id === 'aceite' || id === 'humedad' || id === 'arena' ? rand() * 6 : (rand() - 0.5) * 0.08), 0.85 + rand() * 0.3);
+        }
+        // Frenadas antes de llegar al cruce
+        if (L > 60 && rand() < 0.7) {
+          const pose = map.roadPose(road.id, L - 20 - rand() * 8, li);
+          if (map.query(pose.x, pose.z).surface === 'calzada') put(rand() < 0.5 ? 'frenada-doble' : 'frenada-curva', pose.x, pose.z, pose.heading, 1);
+        }
+      });
+    }
+    const decalMat = mat(new THREE.MeshLambertMaterial({ map: lib.decals, transparent: true, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -3, polygonOffsetUnits: -3 }));
+    patchWorldMaterial(decalMat, 'baked', u, pg, { macro: 0, detail: 0 });
+    for (const gd of geos.values()) add(gd.build(), decalMat, { receive: true, order: 2, chunk: 'detail' });
+  }
+
+  // --- Niveles de calidad: solo se cambian referencias a texturas ya generadas y subidas (sin recompilar ni crear nada)
   let spec = LEVEL_SPEC[startLevel];
   let visible = 0;
-  const applyTextures = (t: TexSet) => {
-    const prev = tex;
-    tex = t;
+  let env: THREE.Texture | null = null;
+  let envOn = false;
+  const applyPbr = () => {
+    const a = pbr('asphalt');
     for (const m of [asphaltMat, rampMat]) {
-      m.map = t.asphalt.map;
-      m.normalMap = t.asphalt.normalMap;
-      m.roughnessMap = t.asphalt.roughnessMap;
+      m.map = a.albedo;
+      m.normalMap = a.normal;
     }
-    groundMat.map = t.grass;
-    u.uDirt.value = t.dirt;
-    paintMat.alphaMap = t.wear;
-    walkMat.map = t.paving;
-    shopMat.map = t.shop;
-    for (const st of STYLES) facadeMats.get(st)!.map = t.facades[st];
-    // Libera de la GPU las del nivel anterior (el lienzo queda en caché por si se vuelve a él).
-    if (prev !== t) for (const x of texList(prev)) x.dispose();
+    asphaltPk.uPk.value = a.packed;
+    groundMat.map = pbr('grassA').albedo;
+    u.uGrassN.value = pbr('grassA').normal;
+    u.uGrassB.value = pbr('grassB').albedo;
+    u.uDirt.value = pbr('dirt').albedo;
+    u.uDirtN.value = pbr('dirt').normal;
+    u.uGravel.value = pbr('gravel').albedo;
+    paintMat.map = pbr('line').albedo;
+    paintMat.normalMap = pbr('line').normal;
+    walkMat.map = pbr('paving').albedo;
+    walkMat.normalMap = pbr('paving').normal;
+    walkPk.uPk.value = pbr('paving').packed;
+    wallU.uWallA.value = pbr('brick').albedo;
+    wallU.uWallN.value = pbr('brick').normal;
+    for (const p of projected) p.h.set(pbr(p.id));
   };
+  applyPbr();
 
   return {
     group,
     sky,
     uniforms: u,
-    setLevel(level) {
-      spec = LEVEL_SPEC[level];
-      const t = getTex(spec.tex);
-      if (t !== tex) applyTextures(t);
+    setLevel(l) {
+      spec = LEVEL_SPEC[l];
+      if (l === level) return;
+      level = l;
+      applyPbr();
     },
-    prepare(level) {
-      getTex(LEVEL_SPEC[level].tex);
+    setTexDegrade(step) {
+      if (step === degrade) return;
+      degrade = step;
+      applyPbr();
+    },
+    setEnvMap(e) {
+      env = e;
     },
     setWeather(tint, wet) {
       (dome.material as THREE.MeshBasicMaterial).color.setHex(tint);
       (mountains.material as THREE.MeshBasicMaterial).color.setHex(tint);
-      // Mojado: más liso (brilla el reflejo del sol) y algo más oscuro.
-      for (const m of [asphaltMat, rampMat]) {
-        m.roughness = 1 - 0.45 * wet;
-        m.color.setHex(wet > 0.5 ? 0x45484d : m === asphaltMat ? 0x55585e : 0x5b5e63);
+      // Mojado: el shader oscurece el asfalto, baja su rugosidad y forma charcos. El reflejo de los
+      // charcos es el mapa de entorno estático (cielo): nunca se calcula un reflejo en tiempo real.
+      pg.uWet.value = wet;
+      const on = wet > 0.05 && !!env;
+      if (on !== envOn) {
+        envOn = on;
+        for (const m of [asphaltMat, rampMat]) {
+          m.envMap = on ? env : null;
+          m.envMapIntensity = 0.85;
+          m.needsUpdate = true;
+        }
       }
     },
     cull(cam) {
@@ -895,7 +1027,6 @@ export function buildWorld(map: WorldMap, startLevel: QualityLevel): BuiltWorld 
     visibleChunks: () => visible,
     dispose() {
       for (const d of disposables) d.dispose();
-      for (const t of texCache.values()) for (const x of texList(t)) x.dispose();
     },
   };
 }

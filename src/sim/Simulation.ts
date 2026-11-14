@@ -23,11 +23,14 @@ import { approachingCrosswalk, Pedestrians } from './traffic/pedestrians';
 import { RulesMonitor, type AheadInfo, type ExternalEvent, type RuleEvent } from './rules/monitor';
 import { Instructor } from './instructor/instructor';
 import { TrafficRenderer } from './render/trafficRender';
-import { createClutchAssist, pressForShift, stepClutchAssist } from './vehicle/assist';
+import { createAutoBox, createClutchAssist, pressForShift, stepAutoBox, stepClutchAssist } from './vehicle/assist';
+import { STALL, STALL_CAUSE_LABEL } from './vehicle/specs';
 import { Evaluator } from './rules/evaluation';
 import type { Session, SessionSetup, SessionView } from './lessons/session';
 import { closestOnObb, PARKED_CARS, type Pose } from './world/map';
 import { RPM_PER_RADS, totalRatio } from './vehicle/specs';
+import type { PbrLibrary } from './world/pbr/library';
+import { createPbrGlobals, type PbrGlobals } from './world/pbr/shader';
 import { AdaptiveQuality, LEVEL_LABEL, LEVEL_SPEC, type QualityChange, type QualityLevel } from './render/quality';
 import { makeEnvMap } from './render/envmap';
 import { SUN_OFFSET } from './world/bake';
@@ -78,9 +81,17 @@ export interface HudState {
   showFps: boolean;
   quality: string;
   pixelRatio: number;
+  /** Recorte de texturas por FPS (0 = completas). */
+  texStep: number;
   drawCalls: number;
   gamepad: string | null;
   clutchAssist: boolean;
+  /** Cambio automático (sin embrague ni calado). */
+  automatic: boolean;
+  /** Motor calado y aún sin arrancar: causa en texto (o null). */
+  stalled: string | null;
+  /** 0–1: el motor se está viniendo abajo (vibración). */
+  lug: number;
   ahead: AheadInfo | null;
   session: SessionView | null;
   trafficOn: boolean;
@@ -103,7 +114,6 @@ const AGENTS = { cars: 48, highway: 12, peds: 54 };
 const LEVEL_DENSITY: Record<QualityLevel, number> = { alto: 1, medio: 0.75, bajo: 0.5 };
 
 const EVENT_TEXT: Partial<Record<VehicleEvent, [string, MessageKind]>> = {
-  calado: ['Se ha calado el motor. Pisa el embrague, pon punto muerto y gira la llave (I).', 'bad'],
   arrancado: ['Motor en marcha.', 'info'],
   'motor-apagado': ['Motor apagado.', 'info'],
   'arranque-sin-embrague': ['Para arrancar con una marcha metida, pisa el embrague a fondo.', 'warn'],
@@ -182,6 +192,12 @@ export class Simulation {
   readonly freeEval = new Evaluator();
   private assist = createClutchAssist();
   private assistOn = false;
+  /** Cambio automático y dificultad del calado (Configuración). */
+  private automatic = false;
+  private autoBox = createAutoBox();
+  private stall = STALL.normal;
+  /** Sacudida de cámara tras un tirón o un calado (decae sola). */
+  private jolt = 0;
   private slowAcc = 0;
   private external: ExternalEvent[] = [];
   /** Últimos eventos de normas (para la Fase 6 y para depurar). */
@@ -196,7 +212,11 @@ export class Simulation {
   /** Voz del examinador (en el examen siempre habla si el sonido está activado). */
   private examinerVoice: Instructor | null = null;
 
-  constructor(canvas: HTMLCanvasElement, private container: HTMLElement, settings: Settings, private cb: SimCallbacks = {}, spawnId = 'centro', readonly session: Session | null = null, scenario: Scenario | null = null) {
+  private pbrG: PbrGlobals;
+  private texStep = 0;
+
+  /** `lib`: texturas PBR ya generadas en la pantalla de carga (la simulación no crea ninguna al conducir). */
+  constructor(canvas: HTMLCanvasElement, private container: HTMLElement, settings: Settings, private lib: PbrLibrary, private cb: SimCallbacks = {}, spawnId = 'centro', readonly session: Session | null = null, scenario: Scenario | null = null) {
     this.map = getWorldMap();
     const q = settings.quality;
     // La calidad elegida en Configuración es el nivel de partida (por defecto, Medio); luego se adapta sola.
@@ -240,11 +260,13 @@ export class Simulation {
     this.sun.shadow.normalBias = 0.02;
     this.scene.add(this.sun, this.sun.target);
 
-    this.world = buildWorld(this.map, startLevel);
+    this.pbrG = createPbrGlobals(lib.detail);
+    this.world = buildWorld(this.map, startLevel, lib, this.pbrG, q === 'baja');
     this.scene.add(this.world.group);
     this.envRT = makeEnvMap(this.renderer);
+    this.world.setEnvMap(this.envRT.texture);
     this.blobTex = blobTexture();
-    this.car = buildCar(this.shadowsAllowed, this.envRT.texture, this.blobTex);
+    this.car = buildCar(this.shadowsAllowed, this.envRT.texture, this.blobTex, { lib, globals: this.pbrG });
     this.scene.add(this.car.root);
     this.mirrors = new Mirrors(q);
     this.mirrors.attachSurfaces(this.car.mirrorSurfaces);
@@ -252,6 +274,8 @@ export class Simulation {
     this.input = new InputManager(canvas);
     this.cameraMode = settings.defaultCamera;
     this.vehicle = createVehicle();
+    this.automatic = settings.transmission === 'automatica';
+    this.stall = STALL[settings.stallDifficulty] ?? STALL.normal;
 
     // Tráfico, peatones, señales, normas e instructor (Fase 5)
     this.signals = getSignals(this.map);
@@ -268,7 +292,7 @@ export class Simulation {
     this.monitor = new RulesMonitor(this.signals);
     this.instructor = new Instructor(settings.instructorVoice);
     this.instructor.enabled = settings.instructorText;
-    this.trafficRender = new TrafficRenderer(this.signals, counts[0]! + counts[1]!, counts[2]!, this.envRT.texture, this.blobTex);
+    this.trafficRender = new TrafficRenderer(this.signals, counts[0]! + counts[1]!, counts[2]!, this.envRT.texture, this.blobTex, { lib, globals: this.pbrG });
     this.scene.add(this.trafficRender.group);
     if (session) this.applySetup(session.setup, spawn);
     else if (scenario) this.teleportPose(spawn);
@@ -276,16 +300,9 @@ export class Simulation {
 
     this.applyWeather(scenario?.weather ?? 'despejado');
     this.applyLevel(startLevel);
+    // Todas las texturas (de todos los tamaños) se suben ahora a la GPU: cambiar de nivel al conducir solo cambia referencias.
+    lib.upload(this.renderer);
     this.precompile();
-    // Mientras se lee la pantalla de inicio, se preparan las texturas de los otros niveles (de una en una).
-    const others = (['medio', 'bajo', 'alto'] as QualityLevel[]).filter((l) => l !== startLevel);
-    const prep = () => {
-      const l = others.shift();
-      if (!l || this.disposed) return;
-      this.world.prepare(l);
-      this.prepTimer = window.setTimeout(prep, 150);
-    };
-    this.prepTimer = window.setTimeout(prep, 400);
 
     this.resizeObs = new ResizeObserver(() => this.resize());
     this.resizeObs.observe(container);
@@ -388,10 +405,22 @@ export class Simulation {
 
   private applyQuality(c: QualityChange) {
     if (c.level && c.level !== this.level) this.applyLevel(c.level);
+    if (c.tex !== undefined) this.applyTexStep(c.tex);
     if (c.ratio !== undefined) {
       this.renderer.setPixelRatio(c.ratio);
       this.resize();
     }
+  }
+
+  /**
+   * Recorte de texturas por falta de FPS, sin crear ni volver a subir nada:
+   * 1 = texturas lejanas a 512 px y anisotropía 2; 2 = además se apaga la detail texture.
+   */
+  private applyTexStep(step: number) {
+    this.texStep = step;
+    this.world.setTexDegrade(step >= 1 ? 1 : 0);
+    this.lib.setAnisotropy(this.renderer, step >= 1 ? 2 : this.level === 'alto' ? 8 : 4);
+    this.pbrG.uDetailK.value = step >= 2 ? 0 : 1;
   }
 
   /** Ajusta sombras, distancia de dibujado, detalle y texturas al nivel de calidad. */
@@ -410,6 +439,8 @@ export class Simulation {
     }
     this.car.setBlob(!real);
     this.world.setLevel(level);
+    // Anisotropía 8 solo en Alto (4 en el resto), salvo que esté recortada por FPS.
+    if (this.texStep === 0) this.lib.setAnisotropy(this.renderer, level === 'alto' ? 8 : 4);
     this.mirrors.setRefreshEvery(spec.mirrorEvery);
     // En calidad Baja los retrovisores se desactivan.
     this.mirrors.setLevelEnabled(level !== 'bajo');
@@ -490,7 +521,15 @@ export class Simulation {
   private fixed(dt: number) {
     const v = this.vehicle;
     const controls = { ...this.input.sample(dt) };
-    if (this.assistOn) controls.clutch = Math.max(controls.clutch, stepClutchAssist(this.assist, v, controls.throttle, controls.brake, dt));
+    if (this.automatic) {
+      // Automático: el embrague y las marchas de avance los lleva el coche.
+      const g = stepAutoBox(this.autoBox, v, controls.throttle, dt);
+      if (g !== null) {
+        pressForShift(this.assist, v);
+        shift(v, g);
+      }
+      controls.clutch = stepClutchAssist(this.assist, v, controls.throttle, controls.brake, dt);
+    } else if (this.assistOn) controls.clutch = Math.max(controls.clutch, stepClutchAssist(this.assist, v, controls.throttle, controls.brake, dt));
     const L = CAR.wheelbase / 2;
     const fx = v.x + Math.sin(v.heading) * L, fz = v.z + Math.cos(v.heading) * L;
     const rx = v.x - Math.sin(v.heading) * L, rz = v.z - Math.cos(v.heading) * L;
@@ -501,7 +540,7 @@ export class Simulation {
     const grade = (hf - hr) / CAR.wheelbase;
     const sub = dt / SUBSTEPS;
     for (let i = 0; i < SUBSTEPS; i++) {
-      for (const e of stepVehicle(v, controls, { grade, offroad }, sub)) this.onVehicleEvent(e);
+      for (const e of stepVehicle(v, controls, { grade, offroad, stallRpm: this.stall.rpm, idleAssist: this.stall.assist, noStall: this.automatic }, sub)) this.onVehicleEvent(e);
     }
     v.pitch = Math.atan(grade);
     v.y += ((hf + hr) / 2 + curb - v.y) * Math.min(1, dt * 12);
@@ -766,7 +805,21 @@ export class Simulation {
   }
 
   private onVehicleEvent(e: VehicleEvent) {
-    if (e === 'calado') this.external.push('calado');
+    if (e === 'calado') {
+      const v = this.vehicle;
+      const cause = STALL_CAUSE_LABEL[v.stallCause ?? 'poco-gas'];
+      this.external.push({ code: 'calado', cause, crossing: this.stalledAtBusyJunction() });
+      this.say(`Se ha calado el motor: ${cause}. Pisa el embrague a fondo y arranca de nuevo (I).`, 'bad', 7);
+      // Tirón: cabeceo de la carrocería, sacudida de cámara, sonido y vibración del aparato.
+      this.car.kick(0.5);
+      this.jolt = 1;
+      this.sound.stall();
+      try {
+        navigator.vibrate?.(180);
+      } catch {
+        /* sin vibración */
+      }
+    }
     const t = EVENT_TEXT[e];
     if (t) this.say(t[0], t[1]);
   }
@@ -789,7 +842,16 @@ export class Simulation {
           const i = order.indexOf(v.gear) + (a.type === 'gearUp' ? 1 : -1);
           g = order[Math.max(0, Math.min(order.length - 1, i))]!;
         }
-        if (this.assistOn && g !== v.gear) pressForShift(this.assist, v);
+        if (this.automatic) {
+          // Palanca de automático: R, N y D (cualquier marcha de avance equivale a D).
+          if (a.type !== 'gear') {
+            const sel: Gear[] = ['R', 'N', 1];
+            const i = (typeof v.gear === 'number' ? 2 : sel.indexOf(v.gear)) + (a.type === 'gearUp' ? 1 : -1);
+            g = sel[Math.max(0, Math.min(2, i))]!;
+          }
+          if (typeof g === 'number') g = typeof v.gear === 'number' ? v.gear : 1;
+        }
+        if ((this.assistOn || this.automatic) && g !== v.gear) pressForShift(this.assist, v);
         const ev = shift(v, g);
         if (ev && ev !== 'cambio') this.onVehicleEvent(ev);
         break;
@@ -818,6 +880,27 @@ export class Simulation {
         this.mirrors.enabled = !this.mirrors.enabled;
         break;
     }
+  }
+
+  /**
+   * ¿El calado ha sido en un cruce (o justo antes) con algún vehículo acercándose?
+   * En el examen eso lo convierte en falta deficiente.
+   */
+  private stalledAtBusyJunction(): boolean {
+    if (!this.traffic.enabled) return false;
+    const v = this.vehicle;
+    const info = this.map.query(v.x, v.z);
+    const arm = this.monitor.approachArm;
+    if (!info.junction && !(arm && arm.dist < 10)) return false;
+    for (const c of this.traffic.cars) {
+      if (c.v < 1.5) continue;
+      const dx = v.x - c.x, dz = v.z - c.z;
+      const d = Math.hypot(dx, dz);
+      if (d > 45 || d < 0.1) continue;
+      // Se acerca: su avance apunta hacia el coche del alumno.
+      if ((Math.sin(c.heading) * dx + Math.cos(c.heading) * dz) / d > 0.6) return true;
+    }
+    return false;
   }
 
   /** Embrague asistido (para pantallas táctiles). */
@@ -889,6 +972,11 @@ export class Simulation {
     const inTunnel = v.x > TUNNEL.x0 && v.x < TUNNEL.x1 && Math.abs(v.z - TUNNEL.z) < TUNNEL.halfWidth;
     this.shake.dark += ((inTunnel ? 1 : 0) - this.shake.dark) * Math.min(1, fdt * 3);
     this.car.setDarkness(this.shake.dark);
+    // Motor ahogado o tirón de embrague: vibra el volante y se sacude un poco la cámara.
+    this.jolt = Math.max(Math.max(0, this.jolt - fdt * 2.2), v.jerk * 0.7);
+    const rough = this.paused ? 0 : Math.min(1, v.lug + this.jolt);
+    this.car.setVibration(rough);
+    this.input.vibration = rough;
     this.car.update(v, blinkOn, this.paused ? 0.001 : fdt);
     this.trafficRender.update(this.traffic, this.traffic.enabled ? this.peds : null, this.worldT, blinkOn);
     this.car.root.updateMatrixWorld();
@@ -906,12 +994,14 @@ export class Simulation {
       sh.lastY = v.y;
       const targetY = Math.max(-0.03, Math.min(0.03, -bumpV * 0.004)) + Math.sin(sh.t * 23) * 0.0012 * Math.min(1, speed / 25) * (v.engineOn ? 1 : 0);
       sh.y += (targetY - sh.y) * Math.min(1, fdt * 10);
+      // Vibración leve (no suavizada) cuando el motor se viene abajo o da un tirón.
+      const shudder = rough * (Math.sin(sh.t * 61) * 0.0035 + Math.sin(sh.t * 97) * 0.002);
       const targetPitch = Math.sin(sh.t * 1.7) * 0.0015 * Math.min(1, speed / 20) + Math.max(-0.02, Math.min(0.02, bumpV * 0.003));
       sh.pitch += (targetPitch - sh.pitch) * Math.min(1, fdt * 6);
       const m = this.car.body.matrixWorld;
       cam.position.copy(DRIVER_EYE).applyMatrix4(m);
-      cam.position.y += sh.y;
-      const pitch = look.pitch - 0.08 + sh.pitch;
+      cam.position.y += sh.y + shudder;
+      const pitch = look.pitch - 0.08 + sh.pitch + shudder * 1.5;
       const dir = this.tmpDir.set(Math.sin(look.yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(look.yaw) * Math.cos(pitch));
       const target = this.tmpTarget.copy(DRIVER_EYE).add(dir).applyMatrix4(m);
       target.y += sh.y;
@@ -981,9 +1071,13 @@ export class Simulation {
       showFps: this.showFps,
       quality: LEVEL_LABEL[this.level],
       pixelRatio: this.aq.ratio,
+      texStep: this.texStep,
       drawCalls: this.drawCalls,
       gamepad: this.input.gamepadName,
-      clutchAssist: this.assistOn,
+      clutchAssist: this.assistOn || this.automatic,
+      automatic: this.automatic,
+      stalled: !v.engineOn && v.stallCause ? STALL_CAUSE_LABEL[v.stallCause] : null,
+      lug: v.lug,
       session: this.session?.view() ?? null,
       ahead: this.monitor.ahead,
       trafficOn: this.traffic.enabled,
@@ -1042,6 +1136,7 @@ export class Simulation {
     this.instructor.dispose();
     this.examinerVoice?.dispose();
     this.world.dispose();
+    this.lib.dispose();
     this.envRT.dispose();
     this.blobTex.dispose();
     this.renderer.dispose();

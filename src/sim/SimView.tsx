@@ -20,6 +20,7 @@ import { ZONES, type ZoneId } from './world/zones';
 import { Hud } from './hud/Hud';
 import { TouchControls } from './hud/TouchControls';
 import { KEY_HELP } from './input/input';
+import { loadPbr } from './world/pbr/library';
 
 function webglAvailable(): boolean {
   try {
@@ -129,6 +130,8 @@ function SimView({ mode, onRestart }: { mode: SimMode; onRestart: () => void }) 
   const [hud, setHud] = useState<HudState | null>(null);
   const [started, setStarted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Progreso de la generación de texturas (0–1) o null cuando ya está todo cargado. */
+  const [load, setLoad] = useState<number | null>(0);
   const [touch, setTouch] = useState(coarse);
   const [showHelp, setShowHelp] = useState(false);
   const [portraitOk, setPortraitOk] = useState(false);
@@ -153,27 +156,43 @@ function SimView({ mode, onRestart }: { mode: SimMode; onRestart: () => void }) 
       setError('Este navegador no tiene WebGL 2 activado. Actualiza Safari (15 o posterior) o activa la aceleración por hardware.');
       return;
     }
-    let s: Simulation;
-    try {
-      s = new Simulation(canvas.current, wrap.current, initial.current, {
-        onDriveStats: (m, sec) =>
-          profileStore.update((p) => ({ ...p, practice: { ...p.practice, distanceKm: p.practice.distanceKm + m / 1000, timeSec: p.practice.timeSec + sec } })),
-      }, 'centro', session, scenario);
-    } catch (e) {
-      setError(`No se pudo iniciar el simulador 3D: ${e instanceof Error ? e.message : String(e)}`);
-      return;
-    }
-    setSim(s);
+    let s: Simulation | null = null;
+    let cancelled = false;
+    let id = 0;
     // iOS: impedir el zoom con dos dedos sobre el simulador (touch-action no basta en Safari).
     const noGesture = (e: Event) => e.preventDefault();
     document.addEventListener('gesturestart', noGesture);
-    // Acceso de depuración solo en desarrollo.
-    if (import.meta.env.DEV) (window as unknown as { __sim?: Simulation }).__sim = s;
-    const id = window.setInterval(() => setHud(s.hud()), 66);
+    // Pantalla de carga: las texturas se generan por código (en workers) antes de crear la escena.
+    setLoad(0);
+    loadPbr(initial.current.quality, { touch: coarse() }, (p) => !cancelled && setLoad(p))
+      .then((lib) => {
+        if (cancelled || !canvas.current || !wrap.current) {
+          lib.dispose();
+          return;
+        }
+        try {
+          s = new Simulation(canvas.current, wrap.current, initial.current, lib, {
+            onDriveStats: (m, sec) =>
+              profileStore.update((p) => ({ ...p, practice: { ...p.practice, distanceKm: p.practice.distanceKm + m / 1000, timeSec: p.practice.timeSec + sec } })),
+          }, 'centro', session, scenario);
+        } catch (e) {
+          setError(`No se pudo iniciar el simulador 3D: ${e instanceof Error ? e.message : String(e)}`);
+          return;
+        }
+        const sim = s;
+        setSim(sim);
+        setLoad(null);
+        // Acceso de depuración solo en desarrollo.
+        if (import.meta.env.DEV) (window as unknown as { __sim?: Simulation }).__sim = sim;
+        id = window.setInterval(() => setHud(sim.hud()), 66);
+      })
+      .catch((e) => setError(`No se pudieron generar las texturas: ${e instanceof Error ? e.message : String(e)}`));
     return () => {
+      cancelled = true;
       window.clearInterval(id);
       document.removeEventListener('gesturestart', noGesture);
       delete (window as unknown as { __sim?: Simulation }).__sim;
+      if (!s) return;
       // Errores cometidos en esta sesión → «Errores más frecuentes al volante».
       const byLabel = (session?.evaluator ?? s.freeEval).byLabel();
       if (Object.keys(byLabel).length) {
@@ -244,6 +263,15 @@ function SimView({ mode, onRestart }: { mode: SimMode; onRestart: () => void }) 
   return (
     <div className="sim-root" ref={wrap}>
       <canvas ref={canvas} className="sim-canvas" tabIndex={0} aria-label="Vista del simulador de conducción" />
+      {load !== null && (
+        <div className="sim-loading" role="status" aria-live="polite">
+          <div className="sim-loading-box">
+            <b>Generando texturas…</b>
+            <div className="sim-loading-bar" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(load * 100)}><span style={{ width: `${Math.round(load * 100)}%` }} /></div>
+            <span className="dim num">{Math.round(load * 100)} %</span>
+          </div>
+        </div>
+      )}
       {hud && started && <Hud h={hud} />}
       {hud && started && hud.scenario && (
         <div className="sim-scenario" aria-label="Escenario">
@@ -252,7 +280,7 @@ function SimView({ mode, onRestart }: { mode: SimMode; onRestart: () => void }) 
       )}
       {started && hud?.weather === 'lluvia' && <div className="sim-rain" aria-hidden="true" />}
       {sv && started && sv.status === 'activa' && <SessionPanel v={sv} />}
-      {sim && started && touch && !paused && <TouchControls input={sim.input} gear={hud?.gear ?? 'N'} assist={hud?.clutchAssist ?? false} onMessage={(t, k) => sim.say(t, k, 6)} />}
+      {sim && started && touch && !paused && <TouchControls input={sim.input} gear={hud?.gear ?? 'N'} assist={hud?.clutchAssist ?? false} automatic={hud?.automatic ?? false} engineOn={hud?.engineOn ?? false} stalled={!!hud?.stalled} onMessage={(t, k) => sim.say(t, k, 6)} />}
       {started && touch && portrait && !portraitOk && !paused && (
         <div className="sim-rotate" role="dialog" aria-label="Gira el dispositivo">
           <div className="sim-rotate-icon" aria-hidden="true">⟲</div>

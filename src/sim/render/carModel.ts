@@ -24,6 +24,8 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { CAR } from '../vehicle/specs';
 import type { VehicleState } from '../vehicle/vehicle';
 import { decorTexture, shapeTexture } from './mirrorLook';
+import type { PbrLibrary } from '../world/pbr/library';
+import { patchProjected, type PbrGlobals } from '../world/pbr/shader';
 
 export const DRIVER_EYE = new THREE.Vector3(0.37, 1.17, -0.12);
 /** Capa que solo dibuja la cámara principal (la misma que los detalles del mundo). */
@@ -43,6 +45,10 @@ export interface CarModel {
   setBlob(v: boolean): void;
   /** 0 = pleno día, 1 = oscuridad (túnel): intensidad del haz de los faros en el suelo. */
   setDarkness(k: number): void;
+  /** Tirón (cabeceo brusco) al morder mal el embrague o al calarse. Positivo = morro abajo. */
+  kick(amount: number): void;
+  /** 0–1: vibración del volante cuando el motor se viene abajo. */
+  setVibration(k: number): void;
   dispose(): void;
 }
 
@@ -218,7 +224,7 @@ const stripUv = (g: THREE.BufferGeometry) => {
 };
 
 // ---------------------------------------------------------------- cuadro de instrumentos
-function drawCluster(ctx: CanvasRenderingContext2D, kmh: number, rpm: number, gear: string, lights: { blinkL: boolean; blinkR: boolean; brake: boolean; engine: boolean; beam: boolean }) {
+function drawCluster(ctx: CanvasRenderingContext2D, kmh: number, rpm: number, gear: string, lights: { blinkL: boolean; blinkR: boolean; brake: boolean; engine: boolean; beam: boolean; stalled: boolean }) {
   const W = 256, H = 128;
   ctx.fillStyle = '#05070b';
   ctx.fillRect(0, 0, W, H);
@@ -287,10 +293,32 @@ function drawCluster(ctx: CanvasRenderingContext2D, kmh: number, rpm: number, ge
   ctx.fillText('(P)', 128, 112);
   ctx.fillStyle = !lights.engine ? '#ffb020' : '#1a2232';
   ctx.fillText('⚡', 128, 30);
+  // Motor calado: testigos rojos de batería y presión de aceite, como al quedarse el contacto puesto.
+  if (lights.stalled) {
+    ctx.fillStyle = '#ff3b30';
+    ctx.fillRect(112, 40, 14, 9);
+    ctx.fillRect(114, 38, 3, 2);
+    ctx.fillRect(121, 38, 3, 2);
+    ctx.fillStyle = '#05070b';
+    ctx.fillRect(114, 44, 3, 1);
+    ctx.fillRect(121, 44, 3, 1);
+    ctx.fillRect(122, 43, 1, 3);
+    ctx.fillStyle = '#ff3b30';
+    ctx.beginPath();
+    ctx.moveTo(131, 47);
+    ctx.lineTo(144, 47);
+    ctx.lineTo(146, 42);
+    ctx.lineTo(140, 42);
+    ctx.lineTo(138, 40);
+    ctx.lineTo(133, 40);
+    ctx.lineTo(133, 43);
+    ctx.lineTo(131, 43);
+    ctx.fill();
+  }
 }
 
 // ---------------------------------------------------------------- coche
-export function buildCar(shadows: boolean, envMap: THREE.Texture | null = null, blobMap: THREE.Texture | null = null): CarModel {
+export function buildCar(shadows: boolean, envMap: THREE.Texture | null = null, blobMap: THREE.Texture | null = null, pbr: { lib: PbrLibrary; globals: PbrGlobals } | null = null): CarModel {
   const root = new THREE.Group();
   const body = new THREE.Group();
   root.add(body);
@@ -324,6 +352,21 @@ export function buildCar(shadows: boolean, envMap: THREE.Texture | null = null, 
   const wheelRim = M(new THREE.MeshStandardMaterial({ color: 0x1c1e22, roughness: 0.6 }));
   const liner = M(new THREE.MeshStandardMaterial({ color: 0xb8b5ad, roughness: 0.95, emissive: 0x2a2926 }));
   const pillarMat = M(new THREE.MeshStandardMaterial({ color: 0x3a3c40, roughness: 0.9 }));
+  // Texturas PBR (512 px) proyectadas en coordenadas del coche: no hacen falta UV en la geometría.
+  if (pbr) {
+    const { lib, globals: pg } = pbr;
+    const obj = { space: 'object' as const, detail: 0 };
+    // Pintura: micro-rayones que solo se notan en el brillo (rugosidad del barniz) y escamas metálicas.
+    patchProjected(paint, lib.get('carpaint'), pg, { ...obj, tile: 0.55, albedo: 1.06, normal: 0.2, ao: 0, roughMul: 0.16, clearcoatScratch: 0.3 });
+    // Cristal sucio: velo de polvo y churretes (más mate donde hay suciedad).
+    patchProjected(glass, lib.get('glass'), pg, { ...obj, tile: 0.9, albedo: 1.16, normal: 0.25, ao: 0, roughMul: 0.4 });
+    patchProjected(tyre, lib.get('rubber'), pg, { ...obj, tile: 0.3, albedo: 1.45, normal: 1 });
+    patchProjected(trim, lib.get('plastic'), pg, { ...obj, tile: 0.14, albedo: 1.25, normal: 0.7, roughMul: 0.95 });
+    patchProjected(cabinDark, lib.get('plastic'), pg, { ...obj, tile: 0.1, albedo: 1.25, normal: 0.9, roughMul: 1.15, roughAdd: 0.08 });
+    patchProjected(liner, lib.get('fabric'), pg, { ...obj, tile: 0.09, albedo: 1.2, normal: 0.9 });
+    patchProjected(pillarMat, lib.get('fabric'), pg, { ...obj, tile: 0.09, albedo: 1.2, normal: 0.9 });
+    patchProjected(wheelRim, lib.get('leather'), pg, { ...obj, tile: 0.07, albedo: 1.3, normal: 0.9 });
+  }
 
   // --- Carrocería inferior (capó, aletas, puertas, portón)
   const bodySecs: Section[] = [];
@@ -683,6 +726,7 @@ export function buildCar(shadows: boolean, envMap: THREE.Texture | null = null, 
   // ------------------------------------------------------------ actualización
   const ON_HEAD = 2.2;
   const susp = { pitch: 0, pitchV: 0, roll: 0, rollV: 0, lastV: 0, acc: 0 };
+  let vib = 0, vibT = 0;
   return {
     root,
     body,
@@ -714,7 +758,9 @@ export function buildCar(shadows: boolean, envMap: THREE.Texture | null = null, 
         w.spin.rotation.x = s.wheelSpin;
         if (w.steer) w.steer.rotation.y = s.steerAngle;
       }
-      sw.rotation.z = -s.steerAngle * 14 * 0.5; // desmultiplicación de dirección (~14:1, mostrada a la mitad)
+      vibT += h;
+      // Volante: gira con la dirección y tiembla un poco si el motor se ahoga.
+      sw.rotation.z = -s.steerAngle * 14 * 0.5 + Math.sin(vibT * 71) * 0.012 * vib; // desmultiplicación ~14:1, mostrada a la mitad
       const on = s.lights === 'cortas' || s.lights === 'largas';
       headLamp.emissiveIntensity = on ? (s.lights === 'largas' ? ON_HEAD * 1.3 : ON_HEAD) : s.lights === 'posicion' ? 0.25 : 0;
       tailLamp.emissiveIntensity = s.brake > 0.05 ? 1 : s.lights === 'apagadas' ? 0.08 : 0.45;
@@ -730,10 +776,11 @@ export function buildCar(shadows: boolean, envMap: THREE.Texture | null = null, 
       if (interior.visible) {
         const kmh = Math.round(Math.abs(s.v) * 3.6);
         const rpm = Math.round(s.rpm / 50) * 50;
-        const key = `${kmh}|${rpm}|${s.gear}|${lOn}|${rOn}|${s.handbrake}|${s.engineOn}|${s.lights}`;
+        const stalled = !s.engineOn && s.stallCause !== null;
+        const key = `${kmh}|${rpm}|${s.gear}|${lOn}|${rOn}|${s.handbrake}|${s.engineOn}|${s.lights}|${stalled}`;
         if (key !== clusterKey) {
           clusterKey = key;
-          drawCluster(clusterCtx, kmh, rpm, String(s.gear), { blinkL: lOn, blinkR: rOn, brake: s.handbrake, engine: s.engineOn, beam: s.lights === 'largas' });
+          drawCluster(clusterCtx, kmh, rpm, String(s.gear), { blinkL: lOn, blinkR: rOn, brake: s.handbrake, engine: s.engineOn, beam: s.lights === 'largas', stalled });
           clusterTex.needsUpdate = true;
         }
       }
@@ -746,6 +793,12 @@ export function buildCar(shadows: boolean, envMap: THREE.Texture | null = null, 
     },
     setDarkness(k) {
       darkness = Math.max(0, Math.min(1, k));
+    },
+    kick(amount) {
+      susp.pitchV += amount;
+    },
+    setVibration(k) {
+      vib = k;
     },
     dispose() {
       for (const d of disposables) d.dispose();

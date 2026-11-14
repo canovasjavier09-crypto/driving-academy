@@ -68,4 +68,27 @@ describe('calidad adaptativa', () => {
     run(aq, 60, 12);
     expect(aq.level).toBe('alto');
   });
+
+  it('con FPS bajos sostenidos recorta primero las texturas lejanas y luego la detail texture, y las devuelve después', () => {
+    const q = new AdaptiveQuality(1.5, 'alto');
+    let t = 0;
+    const feed = (fps: number, n: number) => {
+      const out: number[] = [];
+      for (let i = 0; i < n; i++) {
+        const c = q.sample(fps, t++);
+        if (c?.tex !== undefined) out.push(c.tex);
+      }
+      return out;
+    };
+    feed(60, 3); // calentamiento
+    expect(feed(50, 2)).toEqual([]);
+    expect(feed(50, 1)).toEqual([1]); // 3 s seguidos: texturas lejanas y anisotropía
+    expect(feed(50, 3)).toEqual([2]); // 3 s más: detail texture
+    expect(feed(50, 6)).toEqual([]); // no hay más pasos
+    expect(q.tex).toBe(2);
+    // Cuando sobra rendimiento se recuperan una a una antes de subir de nivel
+    const back = feed(60, 60);
+    expect(back.slice(0, 2)).toEqual([1, 0]);
+    expect(q.tex).toBe(0);
+  });
 });

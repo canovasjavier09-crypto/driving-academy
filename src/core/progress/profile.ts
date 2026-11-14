@@ -3,6 +3,8 @@ import type { TheoryCategoryId } from './curriculum';
 
 export type Quality = 'baja' | 'media' | 'alta';
 export type CameraMode = 'primera' | 'tercera';
+export type Transmission = 'manual' | 'automatica';
+export type StallLevel = 'facil' | 'normal' | 'realista';
 
 export interface Settings {
   quality: Quality;
@@ -14,6 +16,10 @@ export interface Settings {
   instructorVoice: boolean;
   defaultCamera: CameraMode;
   reducedMotion: boolean;
+  /** Cambio automático: sin embrague ni calado, para practicar otras cosas. */
+  transmission: Transmission;
+  /** Dificultad del calado (umbral de 400, 500 o 600 rpm). */
+  stallDifficulty: StallLevel;
 }
 
 /** Estado de repetición espaciada por pregunta (sistema Leitner, cajas 0..5). */
@@ -85,6 +91,8 @@ export const DEFAULT_SETTINGS: Settings = {
   instructorVoice: false,
   defaultCamera: 'primera',
   reducedMotion: false,
+  transmission: 'manual',
+  stallDifficulty: 'normal',
 };
 
 export function createDefaultProfile(): Profile {
@@ -125,6 +133,8 @@ export function normalizeProfile(raw: unknown): Profile {
       instructorVoice: bool(s.instructorVoice, DEFAULT_SETTINGS.instructorVoice),
       defaultCamera: oneOf(s.defaultCamera, ['primera', 'tercera'] as const, DEFAULT_SETTINGS.defaultCamera),
       reducedMotion: bool(s.reducedMotion, DEFAULT_SETTINGS.reducedMotion),
+      transmission: oneOf(s.transmission, ['manual', 'automatica'] as const, DEFAULT_SETTINGS.transmission),
+      stallDifficulty: oneOf(s.stallDifficulty, ['facil', 'normal', 'realista'] as const, DEFAULT_SETTINGS.stallDifficulty),
     },
     theory: {
       questions: isObj(t.questions) ? (t.questions as Record<string, QuestionState>) : {},

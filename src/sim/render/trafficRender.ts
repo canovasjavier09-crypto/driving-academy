@@ -4,6 +4,8 @@
  * Las señales son simplificaciones de las españolas (R-1, R-2, R-301), sin escala oficial.
  */
 import * as THREE from 'three';
+import type { PbrLibrary } from '../world/pbr/library';
+import { patchProjected, type PbrGlobals } from '../world/pbr/shader';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { heightAt, PARKED_CARS } from '../world/map';
 import { lightColor, type Signals } from '../world/signals';
@@ -140,7 +142,12 @@ export class TrafficRenderer {
   private c = new THREE.Color();
   private parked = PARKED_CARS.map((p, i) => ({ x: p.x, z: p.z, heading: p.heading, color: [0x8f969e, 0xb3261e, 0xe8e3d3, 0x1d3f8a, 0x40464f][i % 5]!, braking: false, blinker: null as null | 'izquierda' | 'derecha' }));
 
-  constructor(private signals: Signals, maxCars: number, maxPeds: number, envMap: THREE.Texture | null = null, blobMap: THREE.Texture | null = null) {
+  constructor(private signals: Signals, maxCars: number, maxPeds: number, envMap: THREE.Texture | null = null, blobMap: THREE.Texture | null = null, pbr: { lib: PbrLibrary; globals: PbrGlobals } | null = null) {
+    // Metal de postes de semáforo y de señal: arañazos, cepillado y puntos de óxido.
+    const metal = <T extends THREE.Material>(m: T) => {
+      if (pbr) patchProjected(m, pbr.lib.get('metal'), pbr.globals, { space: 'world', tile: 0.8, albedo: 1.15, detail: 0 });
+      return m;
+    };
     const G = <T extends THREE.BufferGeometry>(g: T) => (this.disposables.push(g), g);
     const M = <T extends THREE.Material>(m: T) => (this.disposables.push(m), m);
 
@@ -200,7 +207,7 @@ export class TrafficRenderer {
     const heads = signals.lights;
     const poleG = G(new THREE.CylinderGeometry(0.07, 0.08, 3.4, 6).translate(0, 1.7, 0));
     const housingG = G(new THREE.BoxGeometry(0.34, 0.95, 0.24).translate(0, 3.0, 0));
-    const poles = new THREE.InstancedMesh(poleG, M(new THREE.MeshLambertMaterial({ color: 0x3b4150 })), heads.length);
+    const poles = new THREE.InstancedMesh(poleG, metal(M(new THREE.MeshLambertMaterial({ color: 0x454c5c }))), heads.length);
     const housings = new THREE.InstancedMesh(housingG, M(new THREE.MeshLambertMaterial({ color: 0x1b1e24 })), heads.length);
     this.lamps = new THREE.InstancedMesh(G(new THREE.SphereGeometry(0.1, 10, 8)), M(new THREE.MeshBasicMaterial({ color: 0xffffff })), heads.length * 3);
     heads.forEach((h, i) => {
@@ -225,7 +232,7 @@ export class TrafficRenderer {
       if (list) list.push(sg);
       else kinds.set(k, [sg]);
     }
-    const signPoles = new THREE.InstancedMesh(G(new THREE.CylinderGeometry(0.04, 0.04, 2.1, 6).translate(0, 1.05, 0)), M(new THREE.MeshLambertMaterial({ color: 0x9aa1ad })), signals.signs.length);
+    const signPoles = new THREE.InstancedMesh(G(new THREE.CylinderGeometry(0.04, 0.04, 2.1, 6).translate(0, 1.05, 0)), metal(M(new THREE.MeshLambertMaterial({ color: 0xa6adb9 }))), signals.signs.length);
     let pi = 0;
     const plane = G(new THREE.PlaneGeometry(0.8, 0.8));
     for (const [k, list] of kinds) {

@@ -36,4 +36,15 @@ describe('calificación de faltas', () => {
     expect(ev.verdict().passed).toBe(true);
     expect(ev.byLabel()['Calar el motor']).toBe(1);
   });
+
+  it('calado: leve si es puntual, deficiente en un cruce con vehículos acercándose', () => {
+    expect(severityOf({ code: 'calado', kind: 'falta', value: 0, detail: 'embrague soltado de golpe' })).toBe('leve');
+    expect(severityOf({ code: 'calado', kind: 'falta' })).toBe('leve');
+    expect(severityOf({ code: 'calado', kind: 'falta', value: 1 })).toBe('deficiente');
+    const ev = new Evaluator();
+    ev.zone = 'Centro con semáforos';
+    ev.add([{ code: 'calado', kind: 'falta', value: 1, detail: 'frenar hasta parar sin pisar el embrague; en un cruce con vehículos acercándose' }], 42);
+    expect(ev.faults[0]).toMatchObject({ sev: 'deficiente', t: 42, zone: 'Centro con semáforos' });
+    expect(ev.faults[0]!.detail).toContain('frenar');
+  });
 });

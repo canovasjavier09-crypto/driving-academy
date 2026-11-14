@@ -84,6 +84,8 @@ export function severityOf(e: RuleEvent): Severity | null {
   if (!def) return null;
   if (e.code === 'exceso-velocidad' && e.value !== undefined && e.limit !== undefined && e.value > e.limit * 1.5) return 'eliminatoria';
   if (e.code === 'colision' && e.value !== undefined) return e.value >= 10 ? 'eliminatoria' : 'deficiente';
+  // Un calado puntual es leve; en un cruce con vehículos acercándose crea peligro: deficiente.
+  if (e.code === 'calado' && e.value === 1) return 'deficiente';
   return def.sev;
 }
 

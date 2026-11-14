@@ -17,7 +17,8 @@ export const CAR = {
   finalDrive: 4.1,
   efficiency: 0.9,
   idleRpm: 850,
-  stallRpm: 420,
+  /** Umbral de calado en dificultad Normal (ver `STALL`). */
+  stallRpm: 500,
   redlineRpm: 6200,
   limiterRpm: 6500,
   engineInertia: 0.18, // kg·m²
@@ -81,3 +82,21 @@ export function clutchEngagement(pedal: number): number {
 }
 
 export const RPM_PER_RADS = 60 / (2 * Math.PI);
+
+/** Dificultad del calado: régimen por debajo del cual el motor se para y ayuda de la centralita al ralentí. */
+export type StallDifficulty = 'facil' | 'normal' | 'realista';
+export const STALL: Record<StallDifficulty, { rpm: number; assist: number; label: string }> = {
+  facil: { rpm: 400, assist: 1.3, label: 'Fácil (400 rpm, más tolerante)' },
+  normal: { rpm: 500, assist: 1, label: 'Normal (500 rpm)' },
+  realista: { rpm: 600, assist: 0.85, label: 'Realista (600 rpm)' },
+};
+
+/** Por qué se ha calado el motor (se muestra al alumno y se apunta en el examen). */
+export type StallCause = 'embrague-brusco' | 'frenar-sin-embrague' | 'marcha-larga' | 'pendiente' | 'poco-gas';
+export const STALL_CAUSE_LABEL: Record<StallCause, string> = {
+  'embrague-brusco': 'embrague soltado de golpe',
+  'frenar-sin-embrague': 'frenar hasta parar sin pisar el embrague',
+  'marcha-larga': 'salir en marcha larga sin acelerar',
+  pendiente: 'cuesta arriba con poco gas',
+  'poco-gas': 'poco acelerador al soltar el embrague',
+};

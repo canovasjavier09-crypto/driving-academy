@@ -59,6 +59,30 @@ export class EngineSound {
     this.gain.gain.setTargetAtTime(level, t, 0.08);
   }
 
+  /** Calado: golpe grave y corto mientras el motor se para. */
+  stall() {
+    if (!this.ctx || !this.enabled) return;
+    try {
+      const ctx = this.ctx, t = ctx.currentTime;
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(70, t);
+      o.frequency.exponentialRampToValueAtTime(14, t + 0.45);
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.22 * this.volume + 0.0001, t + 0.03);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.5);
+      const f = ctx.createBiquadFilter();
+      f.type = 'lowpass';
+      f.frequency.value = 260;
+      o.connect(f).connect(g).connect(ctx.destination);
+      o.start(t);
+      o.stop(t + 0.55);
+    } catch {
+      /* sin audio */
+    }
+  }
+
   suspend() {
     void this.ctx?.suspend();
   }

@@ -226,3 +226,25 @@ Leyenda: ✅ hecho y verificado · 🔄 en curso · ⏳ pendiente
 - [x] Espejo derecho convexo (FOV 40° en vez de 32°).
 - [x] Corregido: la imagen de los espejos del coche salía teñida de gris azulado (el color de «apagado» no se quitaba al asignar la imagen).
 - [x] Sin cambio de coste: siguen a 256×128 px, ≤ 20 FPS y desactivados en calidad Baja. Las texturas nuevas se dibujan una sola vez. Comprobado en el navegador (vista interior y exterior), 131 tests y build.
+
+## Mejora: texturas PBR y calado realista
+
+### Texturas
+- [x] Set PBR por material generado por código: albedo, normal (Sobel) y rugosidad + AO empaquetados. 16 materiales: asfalto, línea vial, acera, hierba ×2, tierra, grava, hormigón, ladrillo, metal, cristal sucio, goma, plástico, tela, cuero y pintura del coche.
+- [x] fBm de 3–6 octavas con variación a gran escala, grietas de Voronoi y ramificadas, baches, parches, juntas y bordes desgastados.
+- [x] Detail texture (grano a 8×, solo de cerca) y decals con un único atlas (16 casillas).
+- [x] Lluvia: asfalto más oscuro y liso, y charcos con reflejo del mapa de entorno estático.
+- [x] 1024 px por defecto; 2048 solo asfalto en Alto; 512 en Bajo, lo lejano y el coche. Mipmaps, anisotropía 4 (8 en Alto), sRGB solo en albedo.
+- [x] Pantalla de carga con barra de progreso; generación en workers (unos 2 s en un equipo de 8 núcleos) con reserva en el hilo principal.
+- [x] Recorte por FPS: texturas lejanas y anisotropía, luego la detail texture.
+- [x] Comprobado en el navegador: 60 FPS en Medio, cambios de nivel y de recorte sin errores de WebGL.
+- [ ] Sin probar en un iPad o móvil real (memoria y tiempo de carga).
+- Nota: las fachadas, los locales y el desgaste de la pintura siguen siendo las texturas de canvas anteriores; el ladrillo se añade encima solo en el muro de las viviendas.
+
+### Calado
+- [x] Calado solo por física (nunca al azar), con causa explicada. Tests de cada caso.
+- [x] Dificultad Fácil / Normal / Realista (400 / 500 / 600 rpm) y opción «Cambio automático» en Configuración.
+- [x] Tirón, vibración de cámara y volante, sonido, testigos y aviso «Motor calado».
+- [x] Botón ARRANCAR y embrague táctil más grandes.
+- [x] Examen: falta con zona, momento y causa; deficiente en un cruce con vehículos acercándose.
+- [ ] Sin probar conduciendo con teclado o pantalla táctil de principio a fin: la comprobación en el navegador fue con un calado provocado por script.

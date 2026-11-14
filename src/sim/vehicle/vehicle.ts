@@ -3,16 +3,23 @@
  *
  * - Tren motriz: motor con curva de par, ralentí controlado por centralita,
  *   embrague con punto de fricción (deslizamiento / bloqueo), caja de 5 + R.
- *   El motor se cala si sus rpm caen por debajo de `CAR.stallRpm`.
+ *   El motor se cala solo si sus rpm caen por debajo del umbral (`env.stallRpm`,
+ *   según la dificultad): nunca al azar. Con el embrague pisado o en punto
+ *   muerto el motor no está unido a las ruedas y no puede calarse.
  * - Longitudinal: tracción, frenos, freno de mano, rodadura, aerodinámica y pendiente.
  * - Lateral: modelo de bicicleta cinemático con límite de agarre (subviraje).
  *
  * Convención: rumbo `heading` en radianes; el vector de avance es (sin h, cos h)
  * en el plano XZ. Ángulo de ruedas positivo = giro a la izquierda.
  */
-import { CAR, RPM_PER_RADS, clutchEngagement, engineFriction, maxTorque, throttleMap, totalRatio, type Gear } from './specs';
+import { CAR, RPM_PER_RADS, clutchEngagement, engineFriction, maxTorque, throttleMap, totalRatio, type Gear, type StallCause } from './specs';
 
 const G_ACC = 9.81;
+/** Segundos seguidos por debajo del umbral para que el motor se cale. */
+const STALL_DWELL = 0.5;
+/** La ayuda del ralentí desaparece entre 0,7 y 1,2 veces el umbral de calado. */
+const COLLAPSE_FROM = 0.7;
+const COLLAPSE_SPAN = 0.5;
 
 export type Lights = 'apagadas' | 'posicion' | 'cortas' | 'largas';
 export type Blinker = 'ninguno' | 'izquierda' | 'derecha' | 'emergencia';
@@ -41,6 +48,16 @@ export interface VehicleState {
   belt: boolean;
   fuelL: number;
   odometerM: number;
+  /** Causa del último calado (null cuando el motor se arranca de nuevo). */
+  stallCause: StallCause | null;
+  /** 0–1: el motor «se viene abajo» (vueltas por debajo del ralentí con el embrague mordiendo). */
+  lug: number;
+  /** Velocidad a la que se suelta el embrague (recorrido/s, suavizada; positiva al soltar). */
+  clutchRate: number;
+  /** Tirón (0–1) que decae: al morder el embrague de golpe o al calarse. */
+  jerk: number;
+  /** Tiempo seguido por debajo del umbral de calado (s). */
+  stallT: number;
 }
 
 export interface Controls {
@@ -54,6 +71,12 @@ export interface Env {
   /** Seno de la pendiente en el sentido de avance (positivo = cuesta arriba). */
   grade: number;
   offroad: boolean;
+  /** Régimen de calado (rpm). Por defecto, el de la dificultad Normal. */
+  stallRpm?: number;
+  /** Multiplicador de la ayuda de la centralita al ralentí (dificultad). */
+  idleAssist?: number;
+  /** Cambio automático: el embrague se abre solo antes de que el motor caiga de vueltas; nunca se cala. */
+  noStall?: boolean;
 }
 
 export type VehicleEvent =
@@ -73,6 +96,7 @@ export function createVehicle(x = 0, z = 0, heading = 0): VehicleState {
     throttle: 0, brake: 0, clutch: 0, clutchSlipping: false,
     handbrake: true, lights: 'apagadas', blinker: 'ninguno', blinkerYaw: 0, belt: false,
     fuelL: 32, odometerM: 0,
+    stallCause: null, lug: 0, clutchRate: 0, jerk: 0, stallT: 0,
   };
 }
 
@@ -100,9 +124,13 @@ export function gripSteerLimit(v: number): number {
 /** Avanza la simulación `dt` segundos (usar pasos ≤ 1/120 s). Muta `s` y devuelve los eventos ocurridos. */
 export function stepVehicle(s: VehicleState, c: Controls, env: Env, dt: number): VehicleEvent[] {
   const events: VehicleEvent[] = [];
+  const prevClutch = s.clutch;
   s.throttle = clamp(c.throttle, 0, 1);
   s.brake = clamp(c.brake, 0, 1);
   s.clutch = clamp(c.clutch, 0, 1);
+  if (dt > 0) s.clutchRate += ((prevClutch - s.clutch) / dt - s.clutchRate) * Math.min(1, dt * 6);
+  s.jerk = Math.max(0, s.jerk - dt * 2.5);
+  const stallRpm = env.stallRpm ?? CAR.stallRpm;
 
   // --- Dirección (ligeramente por encima del límite de agarre para poder subvirar) ---
   const target = -clamp(c.steer, -1, 1) * Math.min(CAR.maxSteer, gripSteerLimit(s.v) * 1.2);
@@ -120,8 +148,16 @@ export function stepVehicle(s: VehicleState, c: Controls, env: Env, dt: number):
   let combustion = 0;
   if (s.engineOn) {
     const thr = s.rpm >= CAR.limiterRpm ? 0 : s.throttle;
-    const idle = clamp(engineFriction(s.rpm) + (CAR.idleRpm - s.rpm) * 0.35, 0, CAR.idleTorqueMax);
-    combustion = Math.max(throttleMap(thr) * maxTorque(s.rpm), idle);
+    const assist = env.idleAssist ?? 1;
+    // Centralita: mantiene el ralentí y, al caer de vueltas, inyecta algo más (más en Fácil).
+    // Muy por debajo del ralentí la combustión sin gas se viene abajo: ya no puede recuperarse sola.
+    const collapse = clamp((s.rpm - COLLAPSE_FROM * stallRpm) / (COLLAPSE_SPAN * stallRpm), 0, 1);
+    const idle = clamp(engineFriction(s.rpm) + (CAR.idleRpm - s.rpm) * 0.35 * assist, 0, CAR.idleTorqueMax * assist) * collapse;
+    // El gas del conductor se suma a la ayuda del ralentí y a bajas vueltas responde como a 1200 rpm:
+    // con un poco de acelerador el motor aguanta el tirón en vez de calarse.
+    const low = maxTorque(Math.max(s.rpm, 1200));
+    const pedalT = throttleMap(thr) * low;
+    combustion = Math.max(pedalT, Math.min(pedalT + idle * (1 - 0.5 * thr), Math.max(low, CAR.idleTorqueMax * assist)));
   }
   const Te = combustion - engineFriction(s.rpm);
 
@@ -130,7 +166,10 @@ export function stepVehicle(s: VehicleState, c: Controls, env: Env, dt: number):
   const rolling = (env.offroad ? CAR.offroadRollingCoef : CAR.rollingCoef) * m * G_ACC;
   const Ffric = rolling + s.brake * CAR.brakeForce + (s.handbrake ? CAR.handbrakeForce : 0);
 
-  const cap = G === 0 ? 0 : clutchEngagement(s.clutch) * CAR.clutchMaxTorque;
+  let cap = G === 0 ? 0 : clutchEngagement(s.clutch) * CAR.clutchMaxTorque;
+  // Automático: el embrague se abre solo antes de que el motor caiga demasiado (como un convertidor de par).
+  if (env.noStall && s.engineOn && s.rpm < CAR.idleRpm * 0.85) cap *= clamp((s.rpm - stallRpm) / (CAR.idleRpm * 0.85 - stallRpm), 0, 1) * 0.5;
+  const wasSlipping = s.clutchSlipping;
   s.clutchSlipping = false;
   if (cap > 0) {
     const wc = (s.v * G) / r;
@@ -164,10 +203,28 @@ export function stepVehicle(s: VehicleState, c: Controls, env: Env, dt: number):
   }
   we = Math.max(0, we);
   s.rpm = we * RPM_PER_RADS;
+  // Tirón: el embrague deja de patinar de golpe con mucha diferencia de vueltas.
+  if (wasSlipping && !s.clutchSlipping && s.clutchRate > 2) s.jerk = Math.max(s.jerk, 0.6);
 
-  if (s.engineOn && s.rpm < CAR.stallRpm) {
-    s.engineOn = false;
-    events.push('calado');
+  // Motor «ahogado»: vueltas por debajo del ralentí con una marcha y el embrague mordiendo.
+  const biting = s.engineOn && G !== 0 && clutchEngagement(s.clutch) > 0.05;
+  const lugT = biting ? clamp((CAR.idleRpm * 0.95 - s.rpm) / (CAR.idleRpm * 0.95 - stallRpm), 0, 1) : 0;
+  s.lug += (lugT - s.lug) * Math.min(1, dt * 12);
+
+  // Calado: el régimen cae por debajo del umbral y no se recupera en un instante
+  // (una caída momentánea con gas es solo un tirón), o se hunde del todo.
+  s.stallT = s.engineOn && s.rpm < stallRpm ? s.stallT + dt : 0;
+  if (s.engineOn && (s.stallT > STALL_DWELL || s.rpm < stallRpm * 0.5)) {
+    s.stallT = 0;
+    if (env.noStall) {
+      s.rpm = stallRpm;
+    } else {
+      s.stallCause = stallCauseOf(s, env);
+      s.engineOn = false;
+      s.lug = 0;
+      s.jerk = 1;
+      events.push('calado');
+    }
   }
 
   // --- Combustible (consumo específico ≈ 300 g/kWh + ralentí) ---
@@ -202,6 +259,19 @@ export function stepVehicle(s: VehicleState, c: Controls, env: Env, dt: number):
   return events;
 }
 
+/**
+ * Clasifica la causa de un calado (solo para explicarlo: el calado en sí lo decide la física).
+ * Se mira en este orden: marcha larga al salir, frenar sin embrague, cuesta arriba y embrague brusco.
+ */
+export function stallCauseOf(s: VehicleState, env: Env): StallCause {
+  const speed = Math.abs(s.v);
+  if (typeof s.gear === 'number' && s.gear >= 2 && speed < 2.5 * (s.gear - 1) && s.brake < 0.15) return 'marcha-larga';
+  if (s.brake > 0.15 && speed < 1.5) return 'frenar-sin-embrague';
+  if (env.grade > 0.035 && s.throttle < 0.4) return 'pendiente';
+  if (s.clutchRate > 1.2 || (clutchEngagement(s.clutch) > 0.95 && s.throttle < 0.05)) return 'embrague-brusco';
+  return 'poco-gas';
+}
+
 // ---------------------------------------------------------------------------
 // Acciones discretas del conductor
 // ---------------------------------------------------------------------------
@@ -225,6 +295,7 @@ export function ignition(s: VehicleState): VehicleEvent {
   if (s.fuelL <= 0) return 'sin-combustible';
   if (s.gear !== 'N' && s.clutch < 0.85) return 'arranque-sin-embrague';
   s.engineOn = true;
+  s.stallCause = null;
   s.rpm = Math.max(s.rpm, CAR.idleRpm);
   return 'arrancado';
 }

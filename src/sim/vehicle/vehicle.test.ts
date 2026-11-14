@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { createVehicle, ignition, shift, stepVehicle, kmh, type Controls, type Env, type VehicleEvent, type VehicleState } from './vehicle';
-import { CAR, clutchEngagement } from './specs';
+import { CAR, STALL, clutchEngagement } from './specs';
 
 const DT = 1 / 240;
 const FLAT: Env = { grade: 0, offroad: false };
@@ -120,6 +120,122 @@ describe('salida y calado', () => {
     expect(ev).not.toContain('calado');
     expect(s.v).toBe(0);
     expect(s.engineOn).toBe(true);
+  });
+});
+
+describe('calado realista: causas, tolerancia y dificultad', () => {
+  const env = (extra: Partial<Env> = {}): Env => ({ grade: 0, offroad: false, ...extra });
+  /** Pisa embrague, mete la marcha y suelta en `rel` segundos con `gas` constante. */
+  function release(s: VehicleState, gear: 1 | 2 | 3, gas: number, rel: number, e: Env = FLAT) {
+    run(s, { clutch: 1 }, 0.2, e);
+    shift(s, gear);
+    return run(s, (t) => ({ clutch: Math.max(0, 1 - t / rel), throttle: gas }), rel + 2, e);
+  }
+
+  it('con un poco de gas no se cala aunque se suelte el embrague de golpe: solo da un tirón', () => {
+    const s = started();
+    run(s, { clutch: 1 }, 0.2);
+    shift(s, 1);
+    let jerk = 0;
+    const ev: VehicleEvent[] = [];
+    for (let t = 0; t < 2; t += DT) {
+      ev.push(...stepVehicle(s, { throttle: 0.3, brake: 0, clutch: Math.max(0, 1 - t / 0.3), steer: 0 }, FLAT, DT));
+      jerk = Math.max(jerk, s.jerk, s.lug);
+    }
+    expect(ev).not.toContain('calado');
+    expect(s.engineOn).toBe(true);
+    expect(jerk).toBeGreaterThan(0.3);
+    expect(s.v).toBeGreaterThan(1);
+  });
+
+  it('nunca se cala con el embrague pisado a fondo ni en punto muerto', () => {
+    const a = started();
+    pullAway(a);
+    expect(run(a, { brake: 1, clutch: 1 }, 4)).not.toContain('calado');
+    const b = started();
+    pullAway(b);
+    run(b, { clutch: 1 }, 0.2);
+    shift(b, 'N');
+    expect(run(b, { brake: 1 }, 4)).not.toContain('calado');
+    expect(b.engineOn).toBe(true);
+    // Parado en una cuesta, en 1.ª y con el embrague a fondo: el motor sigue en marcha.
+    const c = started();
+    run(c, { clutch: 1 }, 0.2);
+    shift(c, 1);
+    expect(run(c, { clutch: 1, brake: 0.5 }, 3, env({ grade: 0.12 }))).not.toContain('calado');
+  });
+
+  it('no se cala rodando con velocidad suficiente para la marcha', () => {
+    const s = started();
+    pullAway(s, 1, 0.5);
+    run(s, { throttle: 0.5 }, 3);
+    run(s, { clutch: 1 }, 0.2);
+    shift(s, 2);
+    expect(run(s, { throttle: 0 }, 2)).not.toContain('calado');
+    expect(s.engineOn).toBe(true);
+  });
+
+  it('explica la causa: embrague brusco, frenar sin embrague, marcha larga y pendiente', () => {
+    const a = started();
+    expect(release(a, 1, 0, 0.2)).toContain('calado');
+    expect(a.stallCause).toBe('embrague-brusco');
+
+    const b = started();
+    pullAway(b);
+    expect(run(b, { brake: 0.8 }, 3)).toContain('calado');
+    expect(b.stallCause).toBe('frenar-sin-embrague');
+
+    const c = started();
+    expect(release(c, 3, 0.1, 1.2)).toContain('calado');
+    expect(c.stallCause).toBe('marcha-larga');
+
+    const d = started();
+    d.handbrake = true;
+    run(d, { clutch: 1 }, 0.2);
+    shift(d, 1);
+    d.handbrake = false;
+    expect(run(d, (t) => ({ clutch: Math.max(0, 1 - t / 2), throttle: 0.1 }), 4, env({ grade: 0.1 }))).toContain('calado');
+    expect(d.stallCause).toBe('pendiente');
+  });
+
+  it('en cuesta arriba se sale con gas suficiente y embrague dosificado', () => {
+    const s = started();
+    const ev = release(s, 1, 0.45, 2, env({ grade: 0.1 }));
+    expect(ev).not.toContain('calado');
+    expect(s.v).toBeGreaterThan(1);
+  });
+
+  it('al arrancar de nuevo se borra la causa y el motor queda apagado hasta entonces', () => {
+    const s = started();
+    release(s, 1, 0, 0.2);
+    expect(s.engineOn).toBe(false);
+    run(s, { throttle: 1, clutch: 1 }, 1);
+    expect(s.engineOn).toBe(false);
+    expect(ignition(s)).toBe('arrancado');
+    expect(s.stallCause).toBeNull();
+  });
+
+  it('dificultad: Fácil perdona soltar sin gas, Realista no', () => {
+    const facil = started();
+    expect(release(facil, 1, 0, 3, env({ stallRpm: STALL.facil.rpm, idleAssist: STALL.facil.assist }))).not.toContain('calado');
+    const normal = started();
+    expect(release(normal, 1, 0, 3)).not.toContain('calado');
+    const real = started();
+    expect(release(real, 1, 0, 3, env({ stallRpm: STALL.realista.rpm, idleAssist: STALL.realista.assist }))).toContain('calado');
+    expect(STALL.facil.rpm).toBe(400);
+    expect(STALL.normal.rpm).toBe(500);
+    expect(STALL.realista.rpm).toBe(600);
+  });
+
+  it('cambio automático: nunca se cala', () => {
+    const auto = env({ noStall: true });
+    const s = started();
+    expect(release(s, 1, 0, 0.05, auto)).not.toContain('calado');
+    expect(run(s, { brake: 1 }, 4, auto)).not.toContain('calado');
+    expect(s.engineOn).toBe(true);
+    expect(s.v).toBe(0);
+    expect(run(s, { throttle: 0.5 }, 3, auto)).not.toContain('calado');
+    expect(s.v).toBeGreaterThan(2);
   });
 });
 

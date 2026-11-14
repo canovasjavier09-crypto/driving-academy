@@ -51,7 +51,7 @@ function WheelGraphic({ input }: { input: InputManager }) {
     let raf = 0;
     const tick = () => {
       // Con el sensor activo el volante copia la inclinación real (±90°); si no, la dirección de los botones.
-      const deg = input.tilt.active ? input.tilt.visualAngle() : input.last.steer * 90;
+      const deg = (input.tilt.active ? input.tilt.visualAngle() : input.last.steer * 90) + Math.sin(performance.now() * 0.07) * 2.2 * input.vibration;
       if (ref.current) ref.current.style.transform = `rotate(${deg.toFixed(1)}deg)`;
       raf = requestAnimationFrame(tick);
     };
@@ -148,7 +148,7 @@ function ClutchSlider({ input, assist }: { input: InputManager; assist: boolean 
   );
 }
 
-export function TouchControls({ input, onMessage, gear, assist }: { input: InputManager; onMessage: (text: string, kind: 'info' | 'warn') => void; gear: Gear; assist: boolean }) {
+export function TouchControls({ input, onMessage, gear, assist, automatic = false, engineOn = true, stalled = false }: { input: InputManager; onMessage: (text: string, kind: 'info' | 'warn') => void; gear: Gear; assist: boolean; automatic?: boolean; engineOn?: boolean; stalled?: boolean }) {
   const [tiltOn, setTiltOn] = useState(input.tilt.active);
   const [busy, setBusy] = useState(false);
   const [noSensor, setNoSensor] = useState(!TiltSteering.supported());
@@ -177,7 +177,7 @@ export function TouchControls({ input, onMessage, gear, assist }: { input: Input
     <div className="touch-layer">
       <div className="t-left">
         <div className="t-buttons">
-          <TapButton onTap={act({ type: 'ignition' })}>Llave</TapButton>
+          <TapButton className={`start ${engineOn ? '' : 'off'} ${stalled ? 'stalled' : ''}`} label={engineOn ? 'Apagar el motor' : 'Arrancar el motor'} onTap={act({ type: 'ignition' })}>{engineOn ? 'Motor ⏻' : 'ARRANCAR'}</TapButton>
           <TapButton onTap={act({ type: 'handbrake' })}>(P)</TapButton>
           <TapButton onTap={act({ type: 'belt' })}>Cint.</TapButton>
           <TapButton onTap={act({ type: 'blinker', side: 'izquierda' })} label="Intermitente izquierdo">◂ Int</TapButton>
@@ -205,12 +205,16 @@ export function TouchControls({ input, onMessage, gear, assist }: { input: Input
       </div>
       <div className="t-right">
         <div className="t-gears" aria-label="Palanca de cambios">
-          {GEARS_ROW.map((g) => (
-            <TapButton key={String(g)} className="gear" active={gear === g} label={`Marcha ${g}`} onTap={act({ type: 'gear', gear: g })}>{g}</TapButton>
-          ))}
+          {automatic
+            ? (['R', 'N', 1] as Gear[]).map((g) => (
+                <TapButton key={String(g)} className="gear auto" active={g === 1 ? typeof gear === 'number' : gear === g} label={g === 1 ? 'Marcha adelante (D)' : `Marcha ${g}`} onTap={act({ type: 'gear', gear: g })}>{g === 1 ? (typeof gear === 'number' ? `D${gear}` : 'D') : g}</TapButton>
+              ))
+            : GEARS_ROW.map((g) => (
+                <TapButton key={String(g)} className="gear" active={gear === g} label={`Marcha ${g}`} onTap={act({ type: 'gear', gear: g })}>{g}</TapButton>
+              ))}
         </div>
         <div className="t-pedals">
-          <ClutchSlider input={input} assist={assist} />
+          {!automatic && <ClutchSlider input={input} assist={assist} />}
           <HoldButton input={input} code="KeyS" label="Freno" className="brake" />
           <HoldButton input={input} code="KeyW" label="Gas" className="gas" />
         </div>

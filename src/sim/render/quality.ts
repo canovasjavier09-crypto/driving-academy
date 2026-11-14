@@ -9,6 +9,9 @@
  *   En una pantalla de 60 Hz nunca se superan 62 FPS, así que el umbral de
  *   subida se limita a «la frecuencia de la pantalla − 3» (medida como el
  *   mayor FPS observado).
+ * - Si sigue por debajo de 55 de forma sostenida (3 s), se recortan las texturas:
+ *   primero las lejanas pasan a 512 px y baja la anisotropía; 3 s después se
+ *   apaga la «detail texture». Se recuperan en orden inverso cuando sobra rendimiento.
  * - Si con la resolución al mínimo sigue sin llegar a 55 (o cae por debajo
  *   de 40 dos segundos seguidos), baja un nivel de calidad.
  * - Si con la resolución al máximo sobra rendimiento durante 8 s, sube un
@@ -47,13 +50,20 @@ const HIGH_FPS = 62;
 export interface QualityChange {
   ratio?: number;
   level?: QualityLevel;
+  /** Recorte de texturas: 0 = completas, 1 = lejanas a 512 px y menos anisotropía, 2 = además sin detail texture. */
+  tex?: number;
 }
+
+/** Segundos seguidos por debajo de 55 FPS para cada paso de recorte de texturas. */
+export const TEX_STEP_AFTER = 3;
 
 export class AdaptiveQuality {
   ratio: number;
   level: QualityLevel;
   readonly maxRatio: number;
   fps = 0;
+  /** Paso de recorte de texturas (0–2). */
+  tex = 0;
   private highFor = 0;
   private lowStreak = 0;
   private terribleStreak = 0;
@@ -89,6 +99,11 @@ export class AdaptiveQuality {
       this.atMaxFor = 0;
       this.lowStreak++;
       this.terribleStreak = fps < 40 ? this.terribleStreak + 1 : 0;
+      // Caída sostenida: primero texturas lejanas y anisotropía, luego la detail texture.
+      if (this.lowStreak % TEX_STEP_AFTER === 0 && this.tex < 2) {
+        this.tex++;
+        change.tex = this.tex;
+      }
       const atMin = this.ratio <= RATIO_MIN + 1e-6;
       if (this.allowAuto && this.level !== 'bajo' && ((atMin && this.lowStreak >= 2) || this.terribleStreak >= 2)) {
         this.failedAt[this.level] = now;
@@ -105,7 +120,7 @@ export class AdaptiveQuality {
         this.ratio = r;
         change.ratio = r;
       }
-      return change.ratio !== undefined ? change : null;
+      return change.ratio !== undefined || change.tex !== undefined ? change : null;
     }
 
     this.lowStreak = this.terribleStreak = 0;
@@ -117,6 +132,13 @@ export class AdaptiveQuality {
         this.ratio = Math.min(this.maxRatio, round2(this.ratio * 1.1));
         this.highFor = 0;
         return { ratio: this.ratio };
+      }
+      if (this.atMaxFor >= 8 && this.tex > 0) {
+        // Sobra rendimiento: se devuelven las texturas antes de subir de nivel.
+        this.tex--;
+        this.atMaxFor = 0;
+        this.highFor = 0;
+        return { tex: this.tex };
       }
       if (this.allowAuto && this.atMaxFor >= 8 && this.level !== 'alto') {
         const next = LEVELS[LEVELS.indexOf(this.level) + 1]!;

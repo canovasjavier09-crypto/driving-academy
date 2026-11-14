@@ -53,3 +53,31 @@ export function stepClutchAssist(a: ClutchAssist, v: VehicleState, throttle: num
   }
   return a.value;
 }
+
+/**
+ * Cambio automático (opción de Configuración): elige la marcha de avance según
+ * las vueltas y el acelerador. Devuelve la marcha nueva o null si no cambia.
+ * El embrague lo lleva `stepClutchAssist` y el motor nunca se cala (`noStall`).
+ */
+export interface AutoBox {
+  /** Tiempo hasta poder volver a cambiar (evita cambios seguidos). */
+  cool: number;
+}
+
+export function createAutoBox(): AutoBox {
+  return { cool: 0 };
+}
+
+export function stepAutoBox(a: AutoBox, v: VehicleState, throttle: number, dt: number): 1 | 2 | 3 | 4 | 5 | null {
+  a.cool = Math.max(0, a.cool - dt);
+  if (typeof v.gear !== 'number' || !v.engineOn || a.cool > 0) return null;
+  const g = v.gear;
+  const speed = Math.abs(v.v);
+  let next: number = g;
+  if (speed < 1.5 && g > 1) next = 1;
+  else if (v.rpm > 2300 + 2400 * throttle && g < 5 && !v.clutchSlipping) next = g + 1;
+  else if (v.rpm < 1150 && g > 1) next = g - 1;
+  if (next === g) return null;
+  a.cool = 0.9;
+  return next as 1 | 2 | 3 | 4 | 5;
+}

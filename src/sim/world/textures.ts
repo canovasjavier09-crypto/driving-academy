@@ -3,12 +3,10 @@
  * en mosaico, grietas, manchas, juntas y desgaste dibujados en canvas.
  *
  * - Todas son en mosaico (se repiten sin costuras) y con mipmaps.
- * - Tamaño máximo 1024 px (asfalto en calidad alta); el resto, 512 o menos.
- *   `f` es el factor de tamaño del nivel de calidad (1, 0,5 o 0,25).
- * - Las de suelo son en escala de grises: el color lo ponen el material o el
- *   color de vértice, así una textura sirve para varios tonos.
- * - El asfalto lleva además mapa de normales (relieve del árido y grietas) y
- *   mapa de rugosidad.
+ * - `f` es el factor de tamaño (1 normal, 0,5 en calidad Baja).
+ * - Aquí quedan las dibujadas en canvas: fachadas, locales, desgaste de la
+ *   pintura vial, variación a gran escala y sombra falsa. Los materiales PBR
+ *   (asfalto, acera, hierba, tierra…) están en `pbr/`.
  */
 import * as THREE from 'three';
 import type { BuildingStyle } from './map';
@@ -78,25 +76,6 @@ function fbm(N: number, baseCells: number, octaves: number, r: () => number): Fl
   return out;
 }
 
-/** Dibuja en un canvas de N×M y devuelve la opacidad (canal alfa) como máscara 0..1, en mosaico. */
-function mask(N: number, M: number, draw: (ctx: CanvasRenderingContext2D) => void): Float32Array {
-  const c = document.createElement('canvas');
-  c.width = N;
-  c.height = M;
-  const ctx = c.getContext('2d')!;
-  // Se dibuja nueve veces desplazado para que lo que cruce un borde reaparezca por el contrario.
-  for (const dx of [-N, 0, N]) for (const dy of [-M, 0, M]) {
-    ctx.save();
-    ctx.translate(dx, dy);
-    draw(ctx);
-    ctx.restore();
-  }
-  const d = ctx.getImageData(0, 0, N, M).data;
-  const out = new Float32Array(N * M);
-  for (let i = 0; i < out.length; i++) out[i] = d[i * 4 + 3]! / 255;
-  return out;
-}
-
 function texFromPixels(w: number, h: number, px: (i: number, out: Uint8ClampedArray, o: number) => void, srgb: boolean): THREE.CanvasTexture {
   const c = document.createElement('canvas');
   c.width = w;
@@ -119,172 +98,6 @@ function finish<T extends THREE.Texture>(t: T, srgb: boolean): T {
   t.minFilter = THREE.LinearMipmapLinearFilter;
   t.magFilter = THREE.LinearFilter;
   return t;
-}
-
-/** Mapa de normales (convención OpenGL) a partir de un mapa de alturas en mosaico. */
-function normalFrom(h: Float32Array, N: number, strength: number): THREE.CanvasTexture {
-  return texFromPixels(N, N, (i, d, o) => {
-    const x = i % N, y = (i / N) | 0;
-    const l = h[y * N + ((x - 1 + N) % N)]!, r = h[y * N + ((x + 1) % N)]!;
-    const u = h[((y - 1 + N) % N) * N + x]!, dn = h[((y + 1) % N) * N + x]!;
-    const nx = (l - r) * strength, ny = (dn - u) * strength;
-    const inv = 1 / Math.hypot(nx, ny, 1);
-    d[o] = (nx * inv * 0.5 + 0.5) * 255;
-    d[o + 1] = (ny * inv * 0.5 + 0.5) * 255;
-    d[o + 2] = (inv * 0.5 + 0.5) * 255;
-  }, false);
-}
-
-function crackPaths(ctx: CanvasRenderingContext2D, r: () => number, N: number, count: number, width: number, alpha: number) {
-  ctx.strokeStyle = `rgba(0,0,0,${alpha})`;
-  ctx.lineCap = 'round';
-  for (let i = 0; i < count; i++) {
-    let x = r() * N, y = r() * N;
-    let a = r() * Math.PI * 2;
-    ctx.lineWidth = width * (0.6 + r() * 0.8);
-    ctx.beginPath();
-    ctx.moveTo(x, y);
-    const steps = 6 + Math.floor(r() * 10);
-    for (let k = 0; k < steps; k++) {
-      a += (r() - 0.5) * 1.3;
-      const len = N * (0.008 + r() * 0.018);
-      x += Math.cos(a) * len;
-      y += Math.sin(a) * len;
-      ctx.lineTo(x, y);
-      // Ramificaciones cortas
-      if (r() < 0.25) {
-        const b = a + (r() < 0.5 ? 1 : -1) * (0.6 + r());
-        ctx.moveTo(x + Math.cos(b) * len * 0.8, y + Math.sin(b) * len * 0.8);
-        ctx.lineTo(x, y);
-      }
-    }
-    ctx.stroke();
-  }
-}
-
-export interface AsphaltSet {
-  map: THREE.Texture;
-  normalMap: THREE.Texture;
-  roughnessMap: THREE.Texture;
-}
-
-/** Asfalto (mosaico de 5 m): árido, manchas, parches de reparación y grietas, con relieve y rugosidad. */
-export function asphaltTextures(f: number): AsphaltSet {
-  const N = pow2(1024 * f, 128);
-  const r = rng(11);
-  const aggregate = valueNoise(N, N / 3, r); // piedrecitas del árido (~1,5 cm)
-  const fine = valueNoise(N, N / 1.5, r);
-  const broad = fbm(N, 4, 4, r); // manchas grandes
-  const patches = mask(N, N, (ctx) => {
-    const pr = rng(5);
-    for (let i = 0; i < 3; i++) {
-      ctx.fillStyle = 'rgba(0,0,0,1)';
-      const w = N * (0.12 + pr() * 0.2), h = N * (0.08 + pr() * 0.14);
-      ctx.save();
-      ctx.translate(pr() * N, pr() * N);
-      ctx.rotate((pr() - 0.5) * 0.3);
-      ctx.fillRect(-w / 2, -h / 2, w, h);
-      ctx.restore();
-    }
-  });
-  const cracks = mask(N, N, (ctx) => crackPaths(ctx, rng(7), N, 4, Math.max(0.6, N / 1024), 0.6));
-  const oil = mask(N, N, (ctx) => {
-    const pr = rng(9);
-    for (let i = 0; i < 6; i++) {
-      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
-      g.addColorStop(0, 'rgba(0,0,0,0.5)');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.save();
-      ctx.translate(pr() * N, pr() * N);
-      ctx.scale(N * (0.02 + pr() * 0.05), N * (0.015 + pr() * 0.04));
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(0, 0, 1, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.restore();
-    }
-  });
-  const height = new Float32Array(N * N);
-  const albedo = new Float32Array(N * N);
-  const rough = new Float32Array(N * N);
-  for (let i = 0; i < N * N; i++) {
-    const ag = aggregate[i]!, fi = fine[i]!, br = broad[i]!, pa = patches[i]!, cr = cracks[i]!;
-    // Relieve: árido (más marcado fuera de los parches, que son más lisos), grietas hundidas.
-    height[i] = (ag * 0.7 + fi * 0.3) * (1 - pa * 0.6) - cr * 0.5;
-    // Color: base gris, piedras claras sueltas, manchas, parches más oscuros, aceite.
-    const stone = ag > 0.82 ? (ag - 0.82) * 2.2 : 0;
-    let a = 0.72 + (fi - 0.5) * 0.16 + stone + (br - 0.5) * 0.22;
-    a *= 1 - pa * 0.22;
-    a *= 1 - cr * 0.3;
-    a *= 1 - oil[i]! * 0.45;
-    albedo[i] = a;
-    // Rugosidad: el asfalto viejo es mate; los parches nuevos y el aceite, algo más lisos.
-    rough[i] = 0.92 - pa * 0.12 - oil[i]! * 0.3 + (fi - 0.5) * 0.08 + cr * 0.05;
-  }
-  const map = texFromPixels(N, N, (i, d, o) => {
-    d[o] = d[o + 1] = d[o + 2] = Math.min(1, albedo[i]!) * 255;
-  }, true);
-  const roughnessMap = texFromPixels(N, N, (i, d, o) => {
-    d[o] = d[o + 1] = d[o + 2] = Math.min(1, Math.max(0, rough[i]!)) * 255;
-  }, false);
-  const normalMap = normalFrom(height, N, 2.2 * (N / 1024) + 0.6);
-  return { map, normalMap, roughnessMap };
-}
-
-/** Baldosa de acera (mosaico de 2 m = 4 × 4 losetas de 50 cm). */
-export function pavingTexture(f: number) {
-  const N = pow2(512 * f, 64);
-  const r = rng(12);
-  const grain = valueNoise(N, N / 2, r);
-  const broad = fbm(N, 4, 3, r);
-  const tileShade = Array.from({ length: 16 }, () => 0.9 + r() * 0.12);
-  const joints = mask(N, N, (ctx) => {
-    ctx.strokeStyle = 'rgba(0,0,0,1)';
-    ctx.lineWidth = Math.max(1, N / 128);
-    for (let k = 0; k <= 4; k++) {
-      ctx.beginPath();
-      ctx.moveTo(0, (k * N) / 4);
-      ctx.lineTo(N, (k * N) / 4);
-      ctx.moveTo((k * N) / 4, 0);
-      ctx.lineTo((k * N) / 4, N);
-      ctx.stroke();
-    }
-    crackPaths(ctx, rng(3), N, 2, Math.max(1, N / 512), 0.5);
-  });
-  return texFromPixels(N, N, (i, d, o) => {
-    const x = i % N, y = (i / N) | 0;
-    const t = tileShade[((y * 4) / N | 0) * 4 + ((x * 4) / N | 0)]!;
-    const v = (0.86 + (grain[i]! - 0.5) * 0.12 + (broad[i]! - 0.5) * 0.1) * t * (1 - joints[i]! * 0.4);
-    d[o] = d[o + 1] = d[o + 2] = Math.min(1, v) * 255;
-  }, true);
-}
-
-/** Hierba (mosaico de 9 m, escala de grises; el tono lo da el color de vértice). */
-export function grassTexture(f: number) {
-  const N = pow2(512 * f, 64);
-  const r = rng(13);
-  const blades = valueNoise(N, N / 1.5, r);
-  const clumps = fbm(N, 8, 4, r);
-  return texFromPixels(N, N, (i, d, o) => {
-    const v = 0.78 + (blades[i]! - 0.5) * 0.28 + (clumps[i]! - 0.5) * 0.42;
-    d[o] = d[o + 1] = d[o + 2] = Math.max(0, Math.min(1, v)) * 255;
-  }, true);
-}
-
-/** Tierra y grava (en color): para arcenes de tierra, caminos y calvas en la hierba. */
-export function dirtTexture(f: number) {
-  const N = pow2(512 * f, 64);
-  const r = rng(14);
-  const pebbles = valueNoise(N, N / 2.5, r);
-  const broad = fbm(N, 6, 4, r);
-  return texFromPixels(N, N, (i, d, o) => {
-    const p = pebbles[i]!, b = broad[i]!;
-    const stone = p > 0.78 ? (p - 0.78) * 1.6 : 0;
-    const v = 0.55 + (b - 0.5) * 0.35 + stone + (p - 0.5) * 0.12;
-    d[o] = Math.min(1, v * 0.62 + stone * 0.1) * 255;
-    d[o + 1] = Math.min(1, v * 0.52 + stone * 0.1) * 255;
-    d[o + 2] = Math.min(1, v * 0.4 + stone * 0.12) * 255;
-  }, true);
 }
 
 /** Ruido de baja frecuencia para variar el color a gran escala (rompe la repetición). Lineal. */

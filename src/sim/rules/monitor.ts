@@ -76,7 +76,8 @@ export interface AheadInfo {
   light?: LightColor;
 }
 
-export type ExternalEvent = VehicleEvent | 'atropello' | { code: 'colision'; kmh: number };
+/** `calado` lleva su causa y si ocurrió en un cruce con vehículos acercándose (más grave). */
+export type ExternalEvent = VehicleEvent | 'atropello' | { code: 'colision'; kmh: number } | { code: 'calado'; cause: string; crossing: boolean };
 
 const wrap = (a: number) => Math.atan2(Math.sin(a), Math.cos(a));
 
@@ -147,6 +148,7 @@ export class RulesMonitor {
 
     for (const e of ctx.external ?? []) {
       if (e === 'calado') this.emit(out, t, 'calado', undefined, 3);
+      if (typeof e === 'object' && e.code === 'calado') this.emit(out, t, 'calado', e.crossing ? `${e.cause}; en un cruce con vehículos acercándose` : e.cause, 3, '', { value: e.crossing ? 1 : 0 });
       if (e === 'atropello') this.emit(out, t, 'atropello', undefined, 3);
       if (typeof e === 'object' && e.code === 'colision') this.emit(out, t, 'colision', `${Math.round(e.kmh)} km/h`, 3, '', { value: e.kmh });
     }

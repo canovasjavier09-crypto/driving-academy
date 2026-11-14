@@ -182,3 +182,23 @@ La simulación recibe una `Session` opcional: aplica su configuración inicial (
 - `scenario.ts`: `scenarioFrom(seed, zona?)` es determinista; `pickRandom()` busca una semilla cuya zona no esté entre las 2 últimas; historial en `localStorage` con try/catch.
 - `lessons/exam.ts`: `distTo(zona)` = Dijkstra inverso sobre `graph.feeders` (en caché); `plan(arm, zona)` elige el giro o la salida de rotonda de menor coste; caso especial para el ramal de la autovía (cruce j240_-60) y la salida 3.
 - `Simulation`: `setScenario()` (solo antes de empezar), `applyWeather()`, `applyDensity()` (pooling con `Traffic.setActive` / `Pedestrians.setActive`), `mirrorGlanceT` para la falta de retrovisores y voz propia del examinador.
+
+## 17. Texturas PBR generadas por código (mejora posterior)
+
+- **Dónde:** `src/sim/world/pbr/` — `noise.ts` (fBm, Voronoi, grietas ramificadas, Sobel, AO), `recipes.ts` (16 materiales, detail texture y atlas de decals), `jobs.ts` (plan de tamaños), `worker.ts`, `library.ts` (carga, caché y texturas de Three.js) y `shader.ts` (proyección sin UV y detail texture). Sin DOM: se prueba en Node.
+- **Mapas por material:** albedo (sRGB), normal (Sobel sobre un mapa de alturas, intensidad por material) y un mapa empaquetado lineal: R = oclusión ambiental, G = rugosidad, B = máscara extra (charcos en el asfalto, suciedad en el cristal).
+- **Tamaños:** 1024 px los materiales del mundo; 2048 solo el asfalto y solo si la calidad de partida no es Baja, no es pantalla táctil y hay workers; 512 px los materiales del coche y objetos pequeños, la calidad Baja y lo lejano. Las versiones de 512 salen de reducir la de 1024 (no se vuelven a generar).
+- **Carga:** `SimView` muestra una barra de progreso mientras `loadPbr` reparte los trabajos entre hasta 4 workers (reserva: por bloques en el hilo principal). Luego `PbrLibrary.upload` sube todas las texturas a la GPU. Al conducir no se crea ni se sube ninguna: cambiar de nivel solo cambia referencias.
+- **Shaders:** `shading.ts` (asfalto, terreno, acera/pintura/decals y fachadas) y `pbr/shader.ts` (`patchProjected`: proyección por el eje dominante para coche, farolas, barreras y túnel). La detail texture es un grano de 256 px mezclado a 8× solo cerca de la cámara; se apaga con un uniform.
+- **Lluvia:** `uWet` oscurece el albedo, baja la rugosidad y forma charcos donde lo dice el canal B; el reflejo es el mapa de entorno estático (nunca en tiempo real).
+- **Decals:** planos fusionados por trozo con un único atlas (frenadas, parches, manchas, grietas selladas, tapas…), en la capa de detalle.
+- **Recorte por FPS** (`AdaptiveQuality.tex`): 3 s seguidos por debajo de 55 FPS → texturas lejanas a 512 px y anisotropía 2; 3 s más → sin detail texture; después sigue el descenso de nivel de siempre. La anisotropía se cambia con un parámetro del muestreador, sin volver a subir la textura.
+
+## 18. Calado realista y cambio automático (mejora posterior)
+
+- **Física** (`vehicle/vehicle.ts`): el motor se cala solo si el régimen pasa 0,5 s seguidos por debajo del umbral (o se hunde por debajo de la mitad). Con el embrague pisado o en punto muerto el motor no está unido a las ruedas, así que no puede calarse. Sin gas, la ayuda del ralentí desaparece al caer de vueltas; con un poco de gas el motor aguanta el tirón.
+- **Umbral por dificultad** (`specs.ts`, `STALL`): Fácil 400 rpm (más ayuda al ralentí), Normal 500, Realista 600. Se elige en Configuración.
+- **Causa** (`stallCauseOf`): embrague brusco, frenar sin embrague, marcha larga, pendiente o poco gas. Se muestra al alumno y se apunta en la falta.
+- **Efectos:** `lug` (motor ahogado) y `jerk` (tirón) mueven la cámara y el volante; al calarse hay cabeceo, sonido, testigos rojos en el cuadro y aviso «Motor calado» hasta volver a arrancar.
+- **Cambio automático** (`assist.ts`, `stepAutoBox` + `noStall`): marchas y embrague solos, sin calado. La palanca pasa a R / N / D.
+- **Examen:** cada calado es una falta con zona, momento y causa. Leve si es puntual; deficiente si ocurre en un cruce (o a menos de 10 m de su línea) con algún vehículo acercándose a menos de 45 m.

@@ -107,6 +107,19 @@ export function SettingsPage() {
               <option value="tercera">Tercera persona</option>
             </select>
           </Field>
+          <Field label="Cambio" hint="Automático: sin embrague ni calado, para practicar otras cosas">
+            <select value={s.transmission} onChange={(e) => setSetting('transmission', e.target.value as Settings['transmission'])} aria-label="Tipo de cambio">
+              <option value="manual">Manual (con embrague)</option>
+              <option value="automatica">Cambio automático</option>
+            </select>
+          </Field>
+          <Field label="Dificultad del calado" hint="Régimen por debajo del cual el motor se cala. Solo con cambio manual">
+            <select value={s.stallDifficulty} disabled={s.transmission === 'automatica'} onChange={(e) => setSetting('stallDifficulty', e.target.value as Settings['stallDifficulty'])} aria-label="Dificultad del calado">
+              <option value="facil">Fácil (400 rpm, más tolerante)</option>
+              <option value="normal">Normal (500 rpm)</option>
+              <option value="realista">Realista (600 rpm)</option>
+            </select>
+          </Field>
           <Field label="Sonido">
             <Switch label="Sonido" checked={s.sound} onChange={(v) => setSetting('sound', v)} />
           </Field>

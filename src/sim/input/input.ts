@@ -91,6 +91,8 @@ export class InputManager {
   readonly tilt = new TiltSteering();
   /** Pedal de embrague táctil (deslizador que se queda donde se suelta). */
   touchClutch = 0;
+  /** 0–1: vibración del volante en pantalla (motor ahogado o tirón); la pone la simulación. */
+  vibration = 0;
   /** Últimos mandos calculados (para dibujar el volante y los pedales táctiles). */
   last: Controls = { throttle: 0, brake: 0, clutch: 0, steer: 0 };
   /** Mirada libre con el ratón (radianes). */
